@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -13,8 +13,9 @@ process.env.PI_TEAM_ROOM_HEARTBEAT_MS = "25";
 process.env.PI_TEAM_ROOM_WAKE = "1";
 process.env.PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS = "1";
 
-// Use Pi's own transpiler and bundled peer dependencies. This keeps the test
-// package dependency-free while working with both the Linux and macOS Pi installs.
+// Use Pi's own transpiler and bundled peer dependencies. The runtime network
+// dependency is installed from package.json; only core Pi peers need wiring for
+// the harness, which works with both the Linux and macOS Pi installs.
 const piBin = execFileSync("sh", ["-lc", "command -v pi"], { encoding: "utf8" }).trim();
 const piCli = realpathSync(piBin);
 const piRoot = resolve(dirname(piCli), "../..");
@@ -22,9 +23,20 @@ const jitiPath = join(piRoot, "node_modules", "jiti", "lib", "jiti.mjs");
 const bundledModules = join(piRoot, "node_modules");
 const localModules = join(root, "node_modules");
 let madeModulesLink = false;
+const madePeerLinks = [];
 if (!existsSync(localModules)) {
   await symlink(bundledModules, localModules, "dir");
   madeModulesLink = true;
+} else {
+  for (const [source, target] of [
+    [join(bundledModules, "typebox"), join(localModules, "typebox")],
+    [join(bundledModules, "@earendil-works", "pi-tui"), join(localModules, "@earendil-works", "pi-tui")],
+  ]) {
+    if (existsSync(target)) continue;
+    await mkdir(dirname(target), { recursive: true });
+    await symlink(source, target, "dir");
+    madePeerLinks.push(target);
+  }
 }
 
 try {
@@ -168,6 +180,7 @@ try {
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   console.log("pi-team-room integration harness: PASS");
 } finally {
+  for (const link of madePeerLinks.reverse()) await rm(link, { recursive: true, force: true });
   if (madeModulesLink) await rm(localModules, { recursive: true, force: true });
   await rm(stateDir, { recursive: true, force: true });
 }

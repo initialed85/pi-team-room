@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Experimental opt-in cross-host sync node with authenticated HTTP reconciliation, mDNS discovery, and static peer fallback for routed networks.
+- Network integration tests covering authentication, state merging, and private state-file permissions.
+
 ## [0.1.0] — 2026-08-30
 
 Initial local release of Pi Team Room:

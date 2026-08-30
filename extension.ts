@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { type TObject, type TSchema, type Static, Type } from "typebox";
@@ -17,6 +19,8 @@ const MAX_SESSIONS = 100;
 const HEARTBEAT_MS = Number(process.env.PI_TEAM_ROOM_HEARTBEAT_MS) || 30_000;
 const WAKE_ENABLED = process.env.PI_TEAM_ROOM_WAKE !== "0";
 const WAKE_MIN_GAP_MS = 20_000;
+const NETWORK_ENABLED = process.env.PI_TEAM_ROOM_NETWORK === "1";
+const NETWORK_SERVICE_PATH = fileURLToPath(new URL("./network-service.mjs", import.meta.url));
 const AUTO_CHECKPOINT_MIN_MS = (() => {
   const parsed = Number(process.env.PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
@@ -137,6 +141,23 @@ function projectLabel(project: string): string {
 
 function statePath(): string {
   return process.env[STATE_ENV] || DEFAULT_STATE_PATH;
+}
+
+function startNetworkService(): void {
+  if (!NETWORK_ENABLED || !process.env.PI_TEAM_ROOM_SHARED_SECRET) return;
+  const forwardedKeys = [
+    "PI_TEAM_ROOM_STATE", "PI_TEAM_ROOM_PORT", "PI_TEAM_ROOM_BIND", "PI_TEAM_ROOM_SHARED_SECRET",
+    "PI_TEAM_ROOM_PEERS", "PI_TEAM_ROOM_NODE_NAME", "PI_TEAM_ROOM_MDNS", "PI_TEAM_ROOM_MDNS_INTERFACE", "PI_TEAM_ROOM_SYNC_MS", "PI_TEAM_ROOM_NODE_GRACE_MS",
+  ];
+  const env: NodeJS.ProcessEnv = { HOME: process.env.HOME, PATH: process.env.PATH };
+  for (const key of forwardedKeys) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  env.PI_TEAM_ROOM_NETWORK = "1";
+  env.PI_TEAM_ROOM_STATE ||= statePath();
+  const child = spawn(process.execPath, [NETWORK_SERVICE_PATH], { detached: true, stdio: "ignore", env });
+  child.on("error", () => undefined);
+  child.unref();
 }
 
 function emptyState(): TeamRoomState {
@@ -568,6 +589,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     projectInfo = undefined;
     await ensureSession(ctx, "idle");
+    startNetworkService();
     await refreshWidget(ctx);
     heartbeat = setInterval(() => {
       void heartbeatOnce(ctx, ctx.isIdle() ? "idle" : "working");

@@ -14,6 +14,7 @@ cd ~/Projects/Home
 git clone <repository-url> pi-team-room
 cd pi-team-room
 git pull --ff-only             # on subsequent updates
+npm ci --ignore-scripts --legacy-peer-deps
 pi install ~/Projects/Home/pi-team-room
 ```
 
@@ -56,17 +57,18 @@ The package is intentionally a normal Git checkout rather than a copied extensio
 ```bash
 cd ~/Projects/Home/pi-team-room
 git pull --ff-only
+npm ci --ignore-scripts --legacy-peer-deps
 npm test
 ```
 
-Because Pi loads this local path directly, `git pull` is enough; `pi install` is only needed once per machine (or after changing the installed package source). For a named release, update `version` in `package.json`, add a short entry to `CHANGELOG.md`, commit, and tag it:
+Because Pi loads this local path directly, source changes do not need a reinstall. Run the dependency command after a fresh clone or whenever `package-lock.json` changes; `pi install` is only needed once per machine (or after changing the installed package source). For a named release, update `version` in `package.json`, add a short entry to `CHANGELOG.md`, commit, and tag it:
 
 ```bash
 git tag -a v0.1.0 -m "Pi team-room 0.1.0"
 git push origin main --tags
 ```
 
-On another host, clone/pull the same checkout and run `pi install ~/Projects/Home/pi-team-room`. The package has no bundled runtime dependencies; Pi supplies its core peer dependencies (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`).
+On another host, clone/pull the same checkout, run `npm ci --ignore-scripts --legacy-peer-deps`, and then run `pi install ~/Projects/Home/pi-team-room`. The package has one runtime dependency (`bonjour-service`) plus core Pi peer dependencies (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`) supplied by Pi.
 
 ### Conversation shutdown signal
 
@@ -90,6 +92,28 @@ When a session shuts down, if it was meaningfully active but never saved an expl
 
 If a teammate sends a **direct** question or reply to an idle-but-open session, the heartbeat delivers it as an untrusted teammate message and triggers an agent turn, so the peer can actually answer without anyone prompting that window. Busy (mid-run) sessions are never interrupted, and broadcasts/updates never wake anyone. The exact `🐈` shutdown signal is marked delivered without triggering a turn, so it cannot start an acknowledgement loop. Set `PI_TEAM_ROOM_WAKE=0` per-session to disable. Fully closed windows stay human-gated.
 
+## Network sync (experimental)
+
+Network mode keeps the same state model across Pi hosts without an internet-facing service. Each host starts one authenticated local node service when a Pi session opens; the service discovers other hosts with mDNS and reconciles state snapshots over HTTP. Local updates, questions, replies, checkpoints, and history then appear on the other host after the next sync interval.
+
+It is deliberately opt-in:
+
+```bash
+export PI_TEAM_ROOM_NETWORK=1
+export PI_TEAM_ROOM_SHARED_SECRET='use-a-long-random-value-on-both-hosts'
+pi
+```
+
+Keep the shared secret out of Git, settings committed to a repository, and chat transcripts. The default node port is `43321`; override it with `PI_TEAM_ROOM_PORT` if needed. The service advertises the first physical IPv4 address it finds; set `PI_TEAM_ROOM_ADVERTISE_HOST` when a host has multiple networks or overlays and you need to choose a specific reachable address. If mDNS cannot cross your routed networks, provide one or more reachable endpoints explicitly:
+
+```bash
+export PI_TEAM_ROOM_PEERS='192.168.137.50:43321'
+```
+
+For two ordinary routed subnets such as `192.168.1.0/24` and `192.168.137.0/24`, plan to configure this static peer unless you control the gateway and can enable mDNS reflection. mDNS normally uses link-local multicast (`224.0.0.251` / UDP 5353) and routers do not forward it between subnets. It works across routed networks only when the gateway reflects mDNS, or when the networks are joined by an L2 overlay such as VXLAN. Static peers are the fallback and use ordinary routed TCP. The service advertises only a protocol version and node identifier in mDNS; team state is sent only after bearer-secret authentication.
+
+Network mode is currently intended for trusted home/LAN paths: the bearer secret authenticates peers but does not encrypt HTTP traffic. Use a private overlay or wait for the future TLS/paired transport before using it across an untrusted network. See [SECURITY.md](SECURITY.md).
+
 ## Design notes
 
 - Presence is ephemeral-ish: stale sessions are hidden from the pulse after 30 minutes, but their last checkpoint and history remain.
@@ -109,5 +133,14 @@ If a teammate sends a **direct** question or reply to an idle-but-open session, 
 | `PI_TEAM_ROOM_HEARTBEAT_MS` | `30000` | Presence ping + inbox poll period |
 | `PI_TEAM_ROOM_WAKE` | `1` | Allow auto-wake turns for idle peers (`0` disables) |
 | `PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS` | `120000` | Minimum session activity before shutdown auto-checkpoint |
+| `PI_TEAM_ROOM_NETWORK` | `0` | Start the per-host network sync node (`1` enables) |
+| `PI_TEAM_ROOM_SHARED_SECRET` | unset | Required shared bearer secret for network sync |
+| `PI_TEAM_ROOM_PORT` | `43321` | Network sync node TCP port |
+| `PI_TEAM_ROOM_ADVERTISE_HOST` | auto | IPv4 address placed in the mDNS TXT hint |
+| `PI_TEAM_ROOM_BIND` | `0.0.0.0` | Network node listen address |
+| `PI_TEAM_ROOM_PEERS` | unset | Comma-separated `host:port` static sync peers |
+| `PI_TEAM_ROOM_MDNS` | `1` | Enable mDNS publish/discovery (`0` disables) |
+| `PI_TEAM_ROOM_MDNS_INTERFACE` | auto | Optional local IPv4 interface for mDNS |
+| `PI_TEAM_ROOM_SYNC_MS` | `5000` | Network state reconciliation period |
 
 The state file is local to this user account and is not intended as a multi-user coordination channel or cross-host transport. It contains plaintext work metadata and is not encrypted; see [SECURITY.md](SECURITY.md) before publishing or using the package with a shared account. Stale sessions disappear from the live view after 30 minutes; their historical checkpoints and updates remain available.
