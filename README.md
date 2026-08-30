@@ -6,7 +6,7 @@ It deliberately has no hierarchy, assignments, ticket workflow, or automatic for
 
 ## Install for Pi
 
-Clone or check out this repository somewhere stable, then install the local package:
+Requires Node.js 22.6 or newer and a working Pi installation. Clone or check out this repository somewhere stable, then install the local package:
 
 ```bash
 mkdir -p ~/Projects/Home
@@ -64,8 +64,8 @@ npm test
 Because Pi loads this local path directly, source changes do not need a reinstall. Run the dependency command after a fresh clone or whenever `package-lock.json` changes; `pi install` is only needed once per machine (or after changing the installed package source). For a named release, update `version` in `package.json`, add a short entry to `CHANGELOG.md`, commit, and tag it:
 
 ```bash
-git tag -a v0.1.0 -m "Pi team-room 0.1.0"
-git push origin main --tags
+git tag -a vX.Y.Z -m "Pi Team Room X.Y.Z"
+git push origin HEAD --tags
 ```
 
 On another host, clone/pull the same checkout, run `npm ci --ignore-scripts --legacy-peer-deps`, and then run `pi install ~/Projects/Home/pi-team-room`. The package has one runtime dependency (`bonjour-service`) plus core Pi peer dependencies (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`) supplied by Pi.
@@ -86,7 +86,7 @@ While a session is open, a compact **live widget** sits above the editor showing
 
 ## Auto checkpoints
 
-When a session shuts down, if it was meaningfully active but never saved an explicit `checkpoint`, the extension leaves an automatic breadcrumb derived from its focus/latest prompt and prefixed `[auto]`. This means even a forgotten session leaves a resume point for teammates — but only as a fallback: explicit checkpoints always win, and barely-started sessions (`PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS` elapsed) create nothing.
+When a session shuts down, if it was meaningfully active but never saved an explicit `checkpoint`, the extension leaves an automatic breadcrumb derived from its focus/latest prompt and prefixed `[auto]`. This means even a forgotten session leaves a resume point for teammates — but only as a fallback: explicit checkpoints always win, and sessions that have not been active for at least `PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS` create nothing.
 
 ## Wake-up (optional)
 
@@ -110,7 +110,7 @@ Keep the shared secret out of Git, settings committed to a repository, and chat 
 export PI_TEAM_ROOM_PEERS='192.168.137.50:43321'
 ```
 
-For two ordinary routed subnets such as `192.168.1.0/24` and `192.168.137.0/24`, plan to configure this static peer unless you control the gateway and can enable mDNS reflection. mDNS normally uses link-local multicast (`224.0.0.251` / UDP 5353) and routers do not forward it between subnets. It works across routed networks only when the gateway reflects mDNS, or when the networks are joined by an L2 overlay such as VXLAN. Static peers are the fallback and use ordinary routed TCP. The service advertises only a protocol version and node identifier in mDNS; team state is sent only after bearer-secret authentication.
+For two ordinary routed subnets such as `192.168.1.0/24` and `192.168.137.0/24`, plan to configure this static peer unless you control the gateway and can enable mDNS reflection. mDNS normally uses link-local multicast (`224.0.0.251` / UDP 5353) and routers do not forward it between subnets. It works across routed networks only when the gateway reflects mDNS, or when the networks are joined by an L2 overlay such as VXLAN. Static peers are the fallback and use ordinary routed TCP. The service advertises discovery metadata (protocol version, node identifier, node name, and an optional address hint) in mDNS; team state is sent only after bearer-secret authentication.
 
 Network mode is currently intended for trusted home/LAN paths: the bearer secret authenticates peers but does not encrypt HTTP traffic. Use a private overlay or wait for the future TLS/paired transport before using it across an untrusted network. See [SECURITY.md](SECURITY.md).
 
@@ -123,7 +123,7 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 - The extension reads and writes the state atomically enough for local peer processes using a lock file and rename-based writes.
 - Shared state is best-effort: if another Pi instance is unavailable, the local session keeps working.
 - All sessions on this machine share one room. Project/repository paths and branches are retained as labels so parallel work remains distinguishable without making any project invisible.
-- `npm test` runs a multi-peer integration harness using isolated extension instances and a temporary state file.
+- `npm test` runs core and network multi-peer integration harnesses using isolated extension instances and temporary state files.
 
 ## Knobs
 
@@ -141,6 +141,8 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 | `PI_TEAM_ROOM_PEERS` | unset | Comma-separated `host:port` static sync peers |
 | `PI_TEAM_ROOM_MDNS` | `1` | Enable mDNS publish/discovery (`0` disables) |
 | `PI_TEAM_ROOM_MDNS_INTERFACE` | auto | Optional local IPv4 interface for mDNS |
+| `PI_TEAM_ROOM_NODE_NAME` | hostname | Name advertised for this host's sync node |
+| `PI_TEAM_ROOM_NODE_GRACE_MS` | `120000` | How long an idle sync node remains alive before exiting |
 | `PI_TEAM_ROOM_SYNC_MS` | `5000` | Network state reconciliation period |
 
-The state file is local to this user account and is not intended as a multi-user coordination channel or cross-host transport. It contains plaintext work metadata and is not encrypted; see [SECURITY.md](SECURITY.md) before publishing or using the package with a shared account. Stale sessions disappear from the live view after 30 minutes; their historical checkpoints and updates remain available.
+The local state file belongs to this user account and is not a multi-user access-control boundary. In network mode it is the local source and destination for explicitly paired cross-host sync; otherwise it remains local to this host. It contains plaintext work metadata and is not encrypted; see [SECURITY.md](SECURITY.md) before publishing or using the package with a shared account. Stale sessions disappear from the live view after 30 minutes; their historical checkpoints and updates remain available.
