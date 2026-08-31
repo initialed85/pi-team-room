@@ -15,7 +15,7 @@ git clone <repository-url> pi-team-room
 cd pi-team-room
 git pull --ff-only             # on subsequent updates
 npm ci --ignore-scripts --legacy-peer-deps
-pi install ~/Projects/Home/pi-team-room
+pi install $(pwd)
 ```
 
 For a direct development checkout, the package can also be referenced from `~/.pi/agent/settings.json`:
@@ -31,7 +31,7 @@ For a direct development checkout, the package can also be referenced from `~/.p
 Or test the extension directly:
 
 ```bash
-pi -e ~/Projects/Home/pi-team-room/extension.ts
+pi -e $(pwd)/extension.ts
 ```
 
 The extension stores shared state in `~/.pi/team-room/state.json` by default. Set `PI_TEAM_ROOM_STATE` to use another path. This is a **machine-wide room on one host**: every Pi session running as this user can see the other live sessions, regardless of which project directory or Git repository they are using.
@@ -56,7 +56,7 @@ The same operations are exposed to the model as `team_room`, so agents can ask p
 The package is intentionally a normal Git checkout rather than a copied extension file. After pulling a change, restart Pi sessions so they reload the extension:
 
 ```bash
-cd ~/Projects/Home/pi-team-room
+cd $(pwd)
 git pull --ff-only
 npm ci --ignore-scripts --legacy-peer-deps
 npm test
@@ -69,7 +69,7 @@ git tag -a vX.Y.Z -m "Pi Team Room X.Y.Z"
 git push origin HEAD --tags
 ```
 
-On another host, clone/pull the same checkout, run `npm ci --ignore-scripts --legacy-peer-deps`, and then run `pi install ~/Projects/Home/pi-team-room`. The package has one runtime dependency (`bonjour-service`) plus core Pi peer dependencies (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`) supplied by Pi.
+On another host, clone/pull the same checkout, run `npm ci --ignore-scripts --legacy-peer-deps`, and then run `pi install $(pwd)`. The package has one runtime dependency (`bonjour-service`) plus core Pi peer dependencies (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`) supplied by Pi.
 
 ### Conversation shutdown signal
 
@@ -83,7 +83,7 @@ When an agent has nothing substantive left to say, it may send a direct reply co
 
 ## TUI summary
 
-While a session is open, a one-line **live widget** sits above the editor showing the active peer names and statuses, with unread counts when relevant. It refreshes on the heartbeat and session events and never enters the LLM context. Press `Ctrl+Up` (or use `/team expand`) to temporarily show focus, checkpoints, and recent updates; press it again or use `/team compact` to collapse it. `/team` (or `/team summary`) also appends a durable themed card to the transcript.
+While a session is open, a one-line **live widget** sits above the editor showing the active peer names and statuses, with unread counts when relevant. It uses the active Pi theme for status markers, names, updates, and unread indicators. In fullscreen TUI mode, expanding temporarily grows the widget; in regular scrollback mode, the compact widget stays fixed and expansion is shown as a non-capturing overlay so the transcript and editor do not jump when it is collapsed. It refreshes on the heartbeat and session events and never enters the LLM context. Press `Shift+Up` (or use `/team expand`) to temporarily show focus, checkpoints, and recent updates; press it again or use `/team compact` to collapse it. `/team` (or `/team summary`) also appends a durable themed card to the transcript.
 
 ## Auto checkpoints
 

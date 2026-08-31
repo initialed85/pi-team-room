@@ -43,6 +43,11 @@ try {
   const { createJiti } = await import(pathToFileURL(jitiPath).href);
   const jiti = createJiti(import.meta.url);
   const extension = await jiti.import(join(root, "extension.ts"));
+  const testTheme = {
+    fg(color, text) { return `[${color}]${text}[/${color}]`; },
+    bg(_color, text) { return text; },
+    bold(text) { return `<bold>${text}</bold>`; },
+  };
 
   function makePeer(id, name, idle = true, project = "/tmp/team-room") {
     const stub = {
@@ -54,6 +59,16 @@ try {
       appendCalls: [],
       renderers: {},
       widgetCalls: [],
+      customCalls: [],
+      overlayComponent: undefined,
+      overlayDone: undefined,
+      overlayStack: [],
+      currentWidgetLines: [],
+      autocompleteLines: 0,
+      previousLines: [],
+      maxLinesRendered: 0,
+      renderNowCalls: 0,
+      clearOnShrink: false,
       on(event, handler) { this.handlers[event] = handler; },
       registerTool(tool) { this.tools[tool.name] = tool; },
       registerCommand(command, definition) { this.commands[command] = definition; },
@@ -70,6 +85,7 @@ try {
     extension.default(stub);
     stub.ctx = {
       cwd: project,
+      mode: "tui",
       hasUI: true,
       sessionManager: {
         getSessionId: () => id,
@@ -78,8 +94,64 @@ try {
       },
       isIdle: () => idle,
       ui: {
+        mode: "regular",
+        theme: testTheme,
+        terminal: { columns: 1000, rows: 40 },
+        get overlayStack() { return stub.overlayStack; },
+        set overlayStack(value) { stub.overlayStack = value; },
+        get previousLines() { return stub.previousLines; },
+        set previousLines(value) { stub.previousLines = value; },
+        get maxLinesRendered() { return stub.maxLinesRendered; },
+        set maxLinesRendered(value) { stub.maxLinesRendered = value; },
+        render() {
+          // Keep enough preceding transcript to exercise upward overlay
+          // placement without making the test depend on a terminal-sized base.
+          return ["history", ...Array.from({ length: 12 }, (_, index) => `history-${index}`), ...stub.currentWidgetLines, "", "editor", "footer",
+            ...Array.from({ length: stub.autocompleteLines }, (_, index) => `autocomplete-${index}`)];
+        },
+        // Model TuiBase's regular-mode overlay compositor: it pads short
+        // renders to terminal height before compositing an overlay.
+        compositeOverlays(lines, _width, height) {
+          if (stub.overlayStack.length === 0) return [...lines];
+          const result = [...lines];
+          while (result.length < height) result.push("");
+          return result;
+        },
         notify() {},
-        setWidget(widgetId, lines) { stub.widgetCalls.push({ widgetId, lines }); },
+        custom(factory, options) {
+          let resolveCustom;
+          const promise = new Promise((resolve) => { resolveCustom = resolve; });
+          let entry;
+          const done = (value) => {
+            if (entry) stub.overlayStack = stub.overlayStack.filter((item) => item !== entry);
+            const top = stub.overlayStack.at(-1);
+            stub.overlayDone = top?.done;
+            stub.overlayComponent = top?.component;
+            resolveCustom(value);
+          };
+          const component = factory(stub.ctx.ui, testTheme, {}, done);
+          entry = { component, done };
+          const resolvedOptions = typeof options?.overlayOptions === "function"
+            ? options.overlayOptions()
+            : options?.overlayOptions;
+          stub.customCalls.push({ component, options, resolvedOptions });
+          if (options?.overlay) {
+            stub.overlayStack.push(entry);
+            stub.overlayComponent = component;
+            stub.overlayDone = done;
+          } else {
+            done(undefined);
+          }
+          return promise;
+        },
+        getClearOnShrink() { return stub.clearOnShrink; },
+        setClearOnShrink(enabled) { stub.clearOnShrink = enabled; },
+        renderNow() { stub.renderNowCalls += 1; },
+        setWidget(widgetId, content, options) {
+          const lines = typeof content === "function" ? content(stub.ctx.ui, testTheme).render(1000) : content;
+          stub.currentWidgetLines = lines ?? [];
+          stub.widgetCalls.push({ widgetId, content, options, lines });
+        },
       },
     };
     return stub;
@@ -95,7 +167,9 @@ try {
   await alpha.handlers.session_start({}, alpha.ctx);
   assert.ok(alpha.widgetCalls.length > 0, "session start renders the live widget");
   assert.equal(alpha.widgetCalls.at(-1).lines.length, 1, "live widget starts in compact mode");
-  assert.ok(alpha.shortcuts["ctrl+up"], "compact widget has a keyboard toggle");
+  assert.equal(alpha.widgetCalls.at(-1).options.placement, "aboveEditor", "live widget stays above the editor");
+  assert.match(alpha.widgetCalls.at(-1).lines[0], /\[accent\]/, "live widget uses theme colors");
+  assert.ok(alpha.shortcuts["shift+up"], "compact widget has a keyboard toggle");
   assert.match(await call(alpha, { action: "focus", text: "auth refactor" }), /Focus updated/);
   assert.match(await call(alpha, { action: "update", text: "found the flaky test" }), /Shared/);
 
@@ -161,11 +235,86 @@ try {
 
   // Summary cards, widgets, and shutdown breadcrumbs are durable/local UI behavior.
   await call(bravo, { action: "update", text: "bravo delivered the cross-project test" });
-  await alpha.shortcuts["ctrl+up"].handler(alpha.ctx);
-  assert.ok(alpha.widgetCalls.at(-1).lines.length > 1, "keyboard toggle expands the live widget");
-  assert.ok(alpha.widgetCalls.at(-1).lines.some((line) => line.includes("cross-project test")));
-  await alpha.shortcuts["ctrl+up"].handler(alpha.ctx);
+  await alpha.shortcuts["shift+up"].handler(alpha.ctx);
+  assert.equal(alpha.widgetCalls.at(-1).lines.length, 1, "regular mode keeps the live widget compact while expanded details are open");
+  assert.ok(alpha.overlayComponent, "regular mode uses a transient summary overlay for expansion");
+  assert.equal(alpha.customCalls.at(-1).resolvedOptions.col, 0, "overlay is anchored to the left edge");
+  assert.ok(alpha.overlayComponent.render(1000).length > 1, "expanded overlay includes summary details");
+  const baseRender = alpha.ctx.ui.render();
+  const compactLine = baseRender.findLastIndex((line) => line.includes("Team:"));
+  const overlayHeight = alpha.overlayComponent.render(1000).length;
+  const expectedOverlayRow = Math.max(0, compactLine - overlayHeight + 1 - Math.max(0, baseRender.length - alpha.ctx.ui.terminal.rows));
+  assert.equal(alpha.customCalls.at(-1).resolvedOptions.row, expectedOverlayRow, "overlay grows upward from the compact widget row");
+  const compositedRender = alpha.ctx.ui.compositeOverlays(baseRender, 1000, alpha.ctx.ui.terminal.rows);
+  assert.ok(compositedRender.length >= baseRender.length, "expanded details remain renderable");
+  assert.ok(compositedRender.length < alpha.ctx.ui.terminal.rows, "regular expansion does not pad short history to terminal height");
+  assert.ok(alpha.overlayComponent.render(1000).some((line) => line.includes("cross-project test")));
+  assert.equal(alpha.renderNowCalls, 0, "expanding does not force a regular-mode redraw");
+
+  // Autocomplete grows the editor below the widget. The expanded summary must
+  // follow that viewport shift without covering the autocomplete rows, and
+  // shrinking back must still allow Pi's regular-mode cleanup while our
+  // non-capturing overlay is mounted.
+  const originalTerminalRows = alpha.ctx.ui.terminal.rows;
+  alpha.ctx.ui.terminal.rows = 15;
+  alpha.autocompleteLines = 0;
+  const noAutocompleteBase = alpha.ctx.ui.render();
+  const noAutocompleteSummaryRow = alpha.customCalls.at(-1).resolvedOptions.row;
+  const noAutocompleteWidgetLine = noAutocompleteBase.findLastIndex((line) => line.includes("Team:"));
+  const noAutocompleteViewportTop = Math.max(0, noAutocompleteBase.length - alpha.ctx.ui.terminal.rows);
+  const noAutocompleteWidgetRow = noAutocompleteWidgetLine - noAutocompleteViewportTop;
+  const noAutocompleteHeight = alpha.overlayComponent.render(1000).length;
+  assert.ok(noAutocompleteSummaryRow + Math.min(noAutocompleteHeight, alpha.customCalls.at(-1).resolvedOptions.maxHeight) <= noAutocompleteWidgetRow + 1,
+    "summary stays above the compact widget");
+  alpha.ctx.ui.previousLines = alpha.ctx.ui.compositeOverlays(noAutocompleteBase, 1000, alpha.ctx.ui.terminal.rows);
+  alpha.ctx.ui.maxLinesRendered = alpha.ctx.ui.previousLines.length;
+
+  alpha.autocompleteLines = 6;
+  const autocompleteBase = alpha.ctx.ui.render();
+  const autocompleteSummaryRow = alpha.customCalls.at(-1).resolvedOptions.row;
+  const autocompleteMaxHeight = alpha.customCalls.at(-1).resolvedOptions.maxHeight;
+  const autocompleteWidgetLine = autocompleteBase.findLastIndex((line) => line.includes("Team:"));
+  const autocompleteViewportTop = Math.max(0, autocompleteBase.length - alpha.ctx.ui.terminal.rows);
+  const autocompleteWidgetRow = autocompleteWidgetLine - autocompleteViewportTop;
+  assert.equal(autocompleteSummaryRow, Math.max(0, noAutocompleteSummaryRow - 6), "summary follows autocomplete viewport movement");
+  assert.ok(autocompleteSummaryRow + Math.min(alpha.overlayComponent.render(1000).length, autocompleteMaxHeight) <= autocompleteWidgetRow + 1,
+    "summary does not cover autocomplete rows");
+  alpha.ctx.ui.previousLines = alpha.ctx.ui.compositeOverlays(autocompleteBase, 1000, alpha.ctx.ui.terminal.rows);
+  alpha.ctx.ui.maxLinesRendered = alpha.ctx.ui.previousLines.length;
+
+  alpha.autocompleteLines = 0;
+  const shrunkBase = alpha.ctx.ui.render();
+  const shrunkOverlay = alpha.ctx.ui.compositeOverlays(shrunkBase, 1000, alpha.ctx.ui.terminal.rows);
+  assert.equal(shrunkOverlay.length, shrunkBase.length, "autocomplete shrink does not retain terminal padding");
+  assert.equal(alpha.ctx.ui.overlayStack.length, 0, "owned overlay is detached during shrink cleanup");
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+  assert.equal(alpha.ctx.ui.overlayStack.length, 1, "owned overlay is restored after shrink cleanup");
+  alpha.ctx.ui.terminal.rows = originalTerminalRows;
+  alpha.autocompleteLines = 0;
+
+  const summaryOverlayComponent = alpha.overlayComponent;
+  await alpha.commands.team.handler("inbox", alpha.ctx);
+  assert.ok(alpha.overlayComponent.render(1000).some((line) => line.includes("Inbox is clear")), "inbox feedback overlays an expanded summary");
+  alpha.overlayDone?.();
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+  assert.equal(alpha.overlayComponent, summaryOverlayComponent, "closing inbox feedback leaves the summary overlay mounted");
+  await alpha.shortcuts["shift+up"].handler(alpha.ctx);
   assert.equal(alpha.widgetCalls.at(-1).lines.length, 1, "keyboard toggle compacts the live widget");
+  assert.equal(alpha.overlayDone, undefined, "collapsing closes the summary overlay");
+  assert.equal(alpha.renderNowCalls, 0, "collapsing does not clear or replay the regular-mode transcript");
+  const collapsedRender = alpha.ctx.ui.compositeOverlays(alpha.ctx.ui.render(), 1000, alpha.ctx.ui.terminal.rows);
+  assert.equal(collapsedRender.length, alpha.ctx.ui.render().length, "the normal compositor is restored after collapse");
+  await alpha.commands.team.handler("expand", alpha.ctx);
+  await alpha.commands.team.handler("compact", alpha.ctx);
+  assert.equal(alpha.renderNowCalls, 0, "the compact command also avoids regular-mode reflow");
+  await alpha.commands.team.handler("inbox", alpha.ctx);
+  assert.ok(alpha.overlayComponent, "regular inbox output uses a transient overlay");
+  assert.ok(alpha.overlayComponent.render(1000).some((line) => line.includes("Inbox is clear")));
+  const inboxBaseRender = alpha.ctx.ui.render();
+  const inboxCompositedRender = alpha.ctx.ui.compositeOverlays(inboxBaseRender, 1000, alpha.ctx.ui.terminal.rows);
+  assert.equal(inboxCompositedRender.length, inboxBaseRender.length, "inbox output does not inflate regular scrollback");
+  alpha.overlayDone?.();
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
   await alpha.commands.team.handler("", alpha.ctx);
   assert.equal(alpha.appendCalls.at(-1)?.type, "pi-team-room-summary");
   assert.ok(alpha.appendCalls.at(-1)?.data.lines.some((line) => line.includes("cross-project test")), "summary card includes peer update");
