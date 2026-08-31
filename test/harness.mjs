@@ -49,6 +49,7 @@ try {
       handlers: {},
       tools: {},
       commands: {},
+      shortcuts: {},
       sendCalls: [],
       appendCalls: [],
       renderers: {},
@@ -56,6 +57,7 @@ try {
       on(event, handler) { this.handlers[event] = handler; },
       registerTool(tool) { this.tools[tool.name] = tool; },
       registerCommand(command, definition) { this.commands[command] = definition; },
+      registerShortcut(shortcut, definition) { this.shortcuts[shortcut] = definition; },
       registerEntryRenderer(type, renderer) { this.renderers[type] = renderer; },
       appendEntry(type, data) { this.appendCalls.push({ type, data }); },
       async sendMessage(message, options) { this.sendCalls.push({ message, options }); },
@@ -92,6 +94,8 @@ try {
   const bravo = makePeer("bbbbbbbb-1111-2222-3333-444444444444", "bravo", true, "/tmp/project-bravo");
   await alpha.handlers.session_start({}, alpha.ctx);
   assert.ok(alpha.widgetCalls.length > 0, "session start renders the live widget");
+  assert.equal(alpha.widgetCalls.at(-1).lines.length, 1, "live widget starts in compact mode");
+  assert.ok(alpha.shortcuts["ctrl+up"], "compact widget has a keyboard toggle");
   assert.match(await call(alpha, { action: "focus", text: "auth refactor" }), /Focus updated/);
   assert.match(await call(alpha, { action: "update", text: "found the flaky test" }), /Shared/);
 
@@ -157,10 +161,15 @@ try {
 
   // Summary cards, widgets, and shutdown breadcrumbs are durable/local UI behavior.
   await call(bravo, { action: "update", text: "bravo delivered the cross-project test" });
+  await alpha.shortcuts["ctrl+up"].handler(alpha.ctx);
+  assert.ok(alpha.widgetCalls.at(-1).lines.length > 1, "keyboard toggle expands the live widget");
+  assert.ok(alpha.widgetCalls.at(-1).lines.some((line) => line.includes("cross-project test")));
+  await alpha.shortcuts["ctrl+up"].handler(alpha.ctx);
+  assert.equal(alpha.widgetCalls.at(-1).lines.length, 1, "keyboard toggle compacts the live widget");
   await alpha.commands.team.handler("", alpha.ctx);
   assert.equal(alpha.appendCalls.at(-1)?.type, "pi-team-room-summary");
+  assert.ok(alpha.appendCalls.at(-1)?.data.lines.some((line) => line.includes("cross-project test")), "summary card includes peer update");
   assert.ok(alpha.renderers["pi-team-room-summary"], "summary entry renderer is registered");
-  assert.ok(alpha.widgetCalls.at(-1)?.lines.some((line) => line.includes("cross-project test")));
 
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
   await alpha.handlers.session_shutdown({}, alpha.ctx);

@@ -39,6 +39,7 @@ The extension stores shared state in `~/.pi/team-room/state.json` by default. Se
 ## Commands
 
 - `/team` or `/team summary` — show the current machine-wide team pulse; also drops a durable TUI summary card (rendered as a colored entry, not sent to the LLM)
+- `/team expand` / `/team compact` — expand or collapse the live team widget
 - `/team focus [text]` — set or inspect this session's broad focus
 - `/team update <text>` — publish a meaningful update
 - `/team ask <agent> <question>` — leave a question for a peer
@@ -82,7 +83,7 @@ When an agent has nothing substantive left to say, it may send a direct reply co
 
 ## TUI summary
 
-While a session is open, a compact **live widget** sits above the editor showing the current room: active peers, their focus, unread messages, and the latest teammate updates. It refreshes on the heartbeat and session events and never enters the LLM context. `/team` (or `/team summary`) also appends a durable themed card to the transcript.
+While a session is open, a one-line **live widget** sits above the editor showing the active peer names and statuses, with unread counts when relevant. It refreshes on the heartbeat and session events and never enters the LLM context. Press `Ctrl+Up` (or use `/team expand`) to temporarily show focus, checkpoints, and recent updates; press it again or use `/team compact` to collapse it. `/team` (or `/team summary`) also appends a durable themed card to the transcript.
 
 ## Auto checkpoints
 

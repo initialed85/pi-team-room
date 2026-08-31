@@ -332,7 +332,17 @@ function renderPulse(state: TeamRoomState, current: WorkSession): string {
   return lines.join("\n");
 }
 
-// Compact always-on lines for the TUI widget and the /team summary card.
+// Compact always-on line for the live TUI widget; durable /team cards stay detailed.
+function renderCompactSummaryLine(state: TeamRoomState, session: WorkSession): string {
+  const peers = activeSessions(state, session).filter((item) => item.id !== session.id);
+  const visible = peers.slice(0, 5).map((peer) => `${truncate(peer.name, 24)} ${peer.status}`);
+  if (visible.length === 0) visible.push("no peers");
+  if (peers.length > visible.length) visible.push(`+${peers.length - visible.length} more`);
+  const unread = unreadMessages(state, session).length;
+  if (unread > 0) visible.push(`${unread} unread`);
+  return `Team: ${visible.join(" | ")}`;
+}
+
 function renderSummaryLines(state: TeamRoomState, session: WorkSession): string[] {
   const lines: string[] = [];
   lines.push(`Team room — machine-wide (current: ${projectLabel(session.project)})`);
@@ -391,6 +401,7 @@ export default function (pi: ExtensionAPI) {
   let projectInfo: { project: string; branch?: string } | undefined;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let lastAutoWakeAt = 0;
+  let summaryExpanded = false;
 
   async function ensureSession(ctx: ContextLike, status: SessionStatus = "idle"): Promise<WorkSession> {
     projectInfo ??= await gitInfo(pi, ctx.cwd);
@@ -515,7 +526,7 @@ export default function (pi: ExtensionAPI) {
   async function refreshWidget(ctx: ContextLike): Promise<void> {
     if (!current || !ctx.hasUI) return;
     const state = await loadState();
-    ctx.ui.setWidget(WIDGET_ID, renderSummaryLines(state, current));
+    ctx.ui.setWidget(WIDGET_ID, summaryExpanded ? renderSummaryLines(state, current) : [renderCompactSummaryLine(state, current)]);
   }
 
   async function appendSummaryCard(session: WorkSession): Promise<void> {
@@ -585,6 +596,14 @@ export default function (pi: ExtensionAPI) {
   async function toolResult(action: string, text: string): Promise<{ content: [{ type: "text"; text: string }]; details: Record<string, unknown> }> {
     return { content: [{ type: "text", text }], details: { action } };
   }
+
+  pi.registerShortcut("ctrl+up", {
+    description: "Expand or collapse the team-room summary",
+    handler: async (ctx) => {
+      summaryExpanded = !summaryExpanded;
+      await refreshWidget(ctx);
+    },
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     projectInfo = undefined;
@@ -707,7 +726,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("team", {
-    description: "Show quiet shared peer context (also drops a TUI summary card); subcommands: focus, update, ask, reply, inbox, checkpoint, remember, history",
+    description: "Show quiet shared peer context (also drops a TUI summary card); subcommands: expand, compact, focus, update, ask, reply, inbox, checkpoint, remember, history",
     handler: async (args, ctx) => {
       const session = await ensureSession(ctx, "idle");
       const [subcommand, ...rest] = args.trim().split(/\s+/);
@@ -719,7 +738,15 @@ export default function (pi: ExtensionAPI) {
           await refreshWidget(ctx);
           return;
         }
-        if (subcommand === "focus") {
+        if (subcommand === "expand" || subcommand === "details") {
+          summaryExpanded = true;
+          await refreshWidget(ctx);
+          ctx.ui.notify("Team summary expanded", "info");
+        } else if (subcommand === "compact" || subcommand === "collapse") {
+          summaryExpanded = false;
+          await refreshWidget(ctx);
+          ctx.ui.notify("Team summary compacted", "info");
+        } else if (subcommand === "focus") {
           if (!text) { ctx.ui.notify(session.focus ? `Focus: ${session.focus}` : "No focus recorded.", "info"); return; }
           current = { ...session, focus: truncate(text, 180), focusPinned: true, updatedAt: now(), lastSeenAt: now() };
           await updateState((state) => { state.sessions = state.sessions.map((item) => item.id === current!.id ? current! : item); });
