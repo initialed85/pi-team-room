@@ -298,7 +298,9 @@ try {
   assert.equal(alpha.widgetCalls.at(-1).lines.length, 1, "regular mode keeps the live widget compact while expanded details are open");
   assert.ok(alpha.overlayComponent, "regular mode uses a transient summary overlay for expansion");
   assert.equal(alpha.customCalls.at(-1).resolvedOptions.col, 0, "overlay is anchored to the left edge");
-  assert.ok(alpha.overlayComponent.render(1000).length > 1, "expanded overlay includes summary details");
+  const expandedSummaryLines = alpha.overlayComponent.render(1000);
+  assert.ok(expandedSummaryLines.length > 1, "expanded overlay includes summary details");
+  assert.ok(expandedSummaryLines.some((line) => line.includes("─") && line.includes("[borderAccent]")), "expanded overlay has a theme-aware separator");
   const baseRender = alpha.ctx.ui.render();
   const compactLine = baseRender.findLastIndex((line) => line.includes("Team:"));
   const overlayHeight = alpha.overlayComponent.render(1000).length;
@@ -391,6 +393,9 @@ try {
   await bravo.handlers.session_shutdown({}, bravo.ctx);
   await charlie.handlers.session_shutdown({}, charlie.ctx);
   await delta.handlers.session_shutdown({}, delta.ctx);
+  await flaky.handlers.session_shutdown({}, flaky.ctx);
+  await foxtrot.handlers.session_shutdown({}, foxtrot.ctx);
+  await manual.handlers.session_shutdown({}, manual.ctx);
   await echo.handlers.session_shutdown({}, echo.ctx);
   // Let any heartbeat callbacks already in flight finish before removing the
   // temporary state directory.

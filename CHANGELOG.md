@@ -6,6 +6,7 @@
 - Recompute regular overlay placement as autocomplete grows, keep the autocomplete list visible, and clean up rows when it shrinks again.
 - Retry failed idle-peer wake delivery and treat manual inbox inspection as delivery to avoid duplicate wakeups.
 - Queue direct messages for busy peers as follow-ups by default, with explicit sender-requested steering and recipient-side relevance guidance.
+- Add a theme-aware highlighted separator to expanded team-room drawers so they remain distinct from teammate chat messages.
 - Experimental opt-in cross-host sync node with authenticated HTTP reconciliation, mDNS discovery, and static peer fallback for routed networks.
 - Network integration tests covering authentication, state merging, and private state-file permissions.
 

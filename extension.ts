@@ -582,6 +582,14 @@ export default function (pi: ExtensionAPI) {
   }, expanded: boolean, includeLeadingSpacer = false, includeTrailingSpacer = false): Box {
     const box = new Box(1, 0, (text) => theme.bg("customMessageBg", text));
     const addLine = (line: string): void => box.addChild(new Text(line, 0, 0));
+    if (expanded) {
+      // Match Pi's standard highlighted divider without importing the interactive
+      // runtime component (the extension also runs in lightweight test/RPC hosts).
+      box.addChild({
+        render: (width: number): string[] => [theme.fg("borderAccent", "─".repeat(Math.max(1, width)))],
+        invalidate: (): void => undefined,
+      });
+    }
     if (includeLeadingSpacer) addLine("");
     const rail = theme.fg("accent", "▌ ");
     const peers = activeSessions(state, session).filter((item) => item.id !== session.id);
@@ -1005,9 +1013,12 @@ export default function (pi: ExtensionAPI) {
     startNetworkService();
     await refreshWidget(ctx);
     heartbeat = setInterval(() => {
-      void heartbeatOnce(ctx, ctx.isIdle() ? "idle" : "working");
-      void deliverPendingMessages(ctx);
-      void refreshWidget(ctx);
+      // Heartbeat work is best-effort. A session can shut down while one of
+      // these asynchronous state operations is in flight; do not turn that
+      // expected race into an unhandled rejection.
+      void heartbeatOnce(ctx, ctx.isIdle() ? "idle" : "working").catch(() => undefined);
+      void deliverPendingMessages(ctx).catch(() => undefined);
+      void refreshWidget(ctx).catch(() => undefined);
     }, HEARTBEAT_MS);
     heartbeat.unref?.();
   });
