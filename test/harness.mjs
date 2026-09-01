@@ -50,12 +50,14 @@ try {
   };
 
   function makePeer(id, name, idle = true, project = "/tmp/team-room") {
+    let idleState = idle;
     const stub = {
       handlers: {},
       tools: {},
       commands: {},
       shortcuts: {},
       sendCalls: [],
+      sendMessageFailures: 0,
       appendCalls: [],
       renderers: {},
       widgetCalls: [],
@@ -75,7 +77,13 @@ try {
       registerShortcut(shortcut, definition) { this.shortcuts[shortcut] = definition; },
       registerEntryRenderer(type, renderer) { this.renderers[type] = renderer; },
       appendEntry(type, data) { this.appendCalls.push({ type, data }); },
-      async sendMessage(message, options) { this.sendCalls.push({ message, options }); },
+      async sendMessage(message, options) {
+        if (this.sendMessageFailures > 0) {
+          this.sendMessageFailures -= 1;
+          throw new Error("simulated send failure");
+        }
+        this.sendCalls.push({ message, options });
+      },
       async exec(command, args) {
         if (command === "git" && args[0] === "rev-parse") return { code: 0, stdout: `${project}\n`, stderr: "" };
         if (command === "git" && args[0] === "branch") return { code: 0, stdout: "main\n", stderr: "" };
@@ -92,7 +100,7 @@ try {
         getSessionName: () => name,
         getBranch: () => [],
       },
-      isIdle: () => idle,
+      isIdle: () => idleState,
       ui: {
         mode: "regular",
         theme: testTheme,
@@ -154,6 +162,7 @@ try {
         },
       },
     };
+    stub.setIdle = (value) => { idleState = value; };
     return stub;
   }
 
@@ -197,15 +206,18 @@ try {
   await call(bravo, { action: "remember", text: "use vitest for team-room tests" });
   assert.match(await call(alpha, { action: "history", query: "vitest" }), /vitest/);
 
-  // Direct questions wake idle peers, but do not interrupt a busy peer.
+  // Direct questions wake idle peers. Busy peers receive a follow-up by default,
+  // while senders can explicitly request a steer when delaying could waste work.
   const charlie = makePeer("cccccccc-1111-2222-3333-444444444444", "charlie", true, "/tmp/project-charlie");
   await charlie.handlers.session_start({}, charlie.ctx);
-  await call(alpha, { action: "ask", agent: "charlie", text: "is the branch ready?" });
+  const autoQuestion = await call(alpha, { action: "ask", agent: "charlie", text: "is the branch ready?" });
+  assert.match(autoQuestion, /delivery: steer \(auto\)/);
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
   const wake = charlie.sendCalls.find((entry) => entry.message?.content?.includes("is the branch ready"));
   assert.ok(wake, "idle peer receives an automatic wake");
   assert.equal(wake.message.customType, "pi-team-room-wake");
   assert.equal(wake.options.triggerTurn, true);
+  assert.equal(wake.options.deliverAs, "steer");
   assert.match(wake.message.content, /untrusted teammate note/);
   const stateAfterWake = JSON.parse(readFileSync(statePath, "utf8"));
   const wakeMessage = stateAfterWake.messages.find((message) => message.text === "is the branch ready?");
@@ -213,14 +225,61 @@ try {
   assert.equal(wakeMessage.readAt, undefined, "wake leaves the message unread");
   assert.equal(charlie.sendCalls.filter((entry) => entry.message?.content?.includes("is the branch ready")).length, 1);
 
+  const flaky = makePeer("ffffffff-1111-2222-3333-444444444444", "flaky", true, "/tmp/project-flaky");
+  await flaky.handlers.session_start({}, flaky.ctx);
+  flaky.sendMessageFailures = 100;
+  await call(alpha, { action: "ask", agent: "flaky", text: "retry this wake" });
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 80));
+  const failedWakeState = JSON.parse(readFileSync(statePath, "utf8"));
+  const failedWakeMessage = failedWakeState.messages.find((message) => message.text === "retry this wake");
+  assert.equal(flaky.sendCalls.length, 0, "failed wake is not recorded as sent");
+  assert.equal(failedWakeMessage.deliveredAt, undefined, "failed wake remains pending");
+  flaky.sendMessageFailures = 0;
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
+  const retriedWakeState = JSON.parse(readFileSync(statePath, "utf8"));
+  const retriedWakeMessage = retriedWakeState.messages.find((message) => message.text === "retry this wake");
+  assert.equal(flaky.sendCalls.length, 1, "pending wake retries after a send failure");
+  assert.ok(retriedWakeMessage.deliveredAt, "retried wake is marked delivered after send succeeds");
+
   const delta = makePeer("dddddddd-1111-2222-3333-444444444444", "delta", false, "/tmp/project-delta");
   await delta.handlers.session_start({}, delta.ctx);
-  await call(alpha, { action: "ask", agent: "delta", text: "how far along are you?" });
+  await delta.handlers.before_agent_start({ systemPrompt: "BASE" }, delta.ctx);
+  const steerQuestion = await call(alpha, { action: "ask", agent: "delta", text: "the API contract changed; adjust your next step", delivery: "steer" });
+  assert.match(steerQuestion, /delivery: steer/);
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
-  assert.equal(delta.sendCalls.length, 0, "busy peer is never interrupted");
-  const stateAfterBusy = JSON.parse(readFileSync(statePath, "utf8"));
-  const busyMessage = stateAfterBusy.messages.find((message) => message.text === "how far along are you?");
-  assert.equal(busyMessage.deliveredAt, undefined, "busy peer message remains pending");
+  const steer = delta.sendCalls.find((entry) => entry.message?.content?.includes("API contract changed"));
+  assert.ok(steer, "busy peer receives an explicitly requested steer");
+  assert.equal(steer.options.deliverAs, "steer");
+  assert.match(steer.message.content, /steering message/);
+
+  const foxtrot = makePeer("12121212-1111-2222-3333-444444444444", "foxtrot", false, "/tmp/project-foxtrot");
+  await foxtrot.handlers.session_start({}, foxtrot.ctx);
+  await foxtrot.handlers.before_agent_start({ systemPrompt: "BASE" }, foxtrot.ctx);
+  const followUpQuestion = await call(alpha, { action: "ask", agent: "foxtrot", text: "when you finish, can you check the logs?" });
+  assert.match(followUpQuestion, /delivery: followUp \(auto\)/);
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
+  const followUp = foxtrot.sendCalls.find((entry) => entry.message?.content?.includes("check the logs"));
+  assert.ok(followUp, "busy peer receives an automatic follow-up");
+  assert.equal(followUp.options.deliverAs, "followUp");
+  assert.match(followUp.message.content, /queued as a follow-up/);
+
+  const manual = makePeer("13131313-1111-2222-3333-444444444444", "manual", false, "/tmp/project-manual");
+  await manual.handlers.session_start({}, manual.ctx);
+  await manual.handlers.before_agent_start({ systemPrompt: "BASE" }, manual.ctx);
+  manual.sendMessageFailures = 100;
+  await call(alpha, { action: "ask", agent: "manual", text: "inspect this when convenient" });
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 80));
+  const pendingManualState = JSON.parse(readFileSync(statePath, "utf8"));
+  const pendingManualMessage = pendingManualState.messages.find((message) => message.text === "inspect this when convenient");
+  assert.equal(pendingManualMessage.deliveredAt, undefined, "failed queued follow-up remains pending");
+  assert.match(await call(manual, { action: "inbox" }), /inspect this when convenient/);
+  const stateAfterManualInbox = JSON.parse(readFileSync(statePath, "utf8"));
+  const manuallyReadMessage = stateAfterManualInbox.messages.find((message) => message.text === "inspect this when convenient");
+  assert.ok(manuallyReadMessage.deliveredAt, "manual inbox inspection records delivery");
+  manual.sendMessageFailures = 0;
+  manual.setIdle(true);
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
+  assert.equal(manual.sendCalls.length, 0, "manually read busy message does not trigger a duplicate wake");
 
   // A terminal 🐈 message is delivered passively and cannot trigger a reply loop.
   const echo = makePeer("eeeeeeee-1111-2222-3333-444444444444", "echo", true, "/tmp/project-echo");
