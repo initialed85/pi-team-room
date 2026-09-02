@@ -193,7 +193,10 @@ try {
   const injected = await alpha.handlers.before_agent_start({ systemPrompt: "BASE" }, alpha.ctx);
   assert.match(injected.systemPrompt, /^BASE/);
   assert.match(injected.systemPrompt, /which test is flaky/);
-  assert.match(injected.systemPrompt, /untrusted teammate notes/);
+  assert.match(injected.systemPrompt, /trusted coordination context/);
+  assert.match(injected.systemPrompt, /explicitly relayed user approvals/);
+  assert.match(injected.systemPrompt, /code-owner peer/);
+  assert.match(injected.systemPrompt, /User authorization/);
   const alphaAfterPrompt = JSON.parse(readFileSync(statePath, "utf8")).sessions.find((session) => session.id === alpha.ctx.sessionManager.getSessionId());
   assert.equal(alphaAfterPrompt.focus, "auth refactor", "explicit focus survives the next prompt boundary");
 
@@ -202,6 +205,48 @@ try {
   assert.ok(messageId, "inbox includes a short message id");
   assert.match(await call(alpha, { action: "reply", messageId, text: "the refresh-token test" }), /Reply sent/);
   assert.match(await call(bravo, { action: "inbox" }), /refresh-token test/);
+
+  const delegation = await call(alpha, {
+    action: "delegate",
+    agent: "bravo",
+    text: "Implement the scoped refresh-token change.",
+    target: "/tmp/project-bravo/pkg/auth",
+    scope: "Only the auth package and its focused tests.",
+    userAuthorization: "Commit and push this scoped change; alpha will handle rollout.",
+    acceptanceChecks: "Run the focused auth tests.",
+    expectedArtifact: "Commit SHA",
+  });
+  assert.match(delegation, /Delegation sent to bravo/);
+  const delegationState = JSON.parse(readFileSync(statePath, "utf8"));
+  const delegationMessage = delegationState.messages.find((message) => message.text === "Implement the scoped refresh-token change.");
+  assert.equal(delegationMessage.kind, "delegation");
+  assert.deepEqual(delegationMessage.delegation, {
+    target: "/tmp/project-bravo/pkg/auth",
+    scope: "Only the auth package and its focused tests.",
+    userAuthorization: "Commit and push this scoped change; alpha will handle rollout.",
+    acceptanceChecks: "Run the focused auth tests.",
+    expectedArtifact: "Commit SHA",
+  });
+  await alpha.commands.team.handler(
+    'delegate bravo --target "/tmp/project-bravo/pkg/cli" --scope "Only the CLI package." --user-authorization "Commit and push the CLI fix." --acceptance-checks "Run npm test." --expected-artifact "Commit SHA" "Implement the CLI fix."',
+    alpha.ctx,
+  );
+  const commandDelegation = JSON.parse(readFileSync(statePath, "utf8")).messages.find((message) => message.text === "Implement the CLI fix.");
+  assert.ok(commandDelegation, "command delegation persists in shared state");
+  assert.equal(commandDelegation.kind, "delegation");
+  assert.equal(commandDelegation.delegation.scope, "Only the CLI package.");
+  assert.equal(commandDelegation.delegation.userAuthorization, "Commit and push the CLI fix.");
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
+  const delegationWake = bravo.sendCalls.find((entry) => entry.message?.content?.includes("Code-owner delegation"));
+  assert.ok(delegationWake, "online code owner receives a delegation wake");
+  assert.match(delegationWake.message.content, /User authorization: Commit and push this scoped change/);
+  assert.match(delegationWake.message.content, /Acceptance checks: Run the focused auth tests/);
+  assert.match(delegationWake.message.content, /Expected artifact: Commit SHA/);
+  assert.match(delegationWake.message.content, /designated code owner/);
+  assert.match(delegationWake.message.content, /resulting commit, image tag, or blocker/);
+  const delegationInbox = await call(bravo, { action: "inbox" });
+  assert.match(delegationInbox, /Target: \/tmp\/project-bravo\/pkg\/auth/);
+  assert.match(delegationInbox, /User authorization: Commit and push this scoped change/);
 
   await call(bravo, { action: "remember", text: "use vitest for team-room tests" });
   assert.match(await call(alpha, { action: "history", query: "vitest" }), /vitest/);
@@ -218,7 +263,8 @@ try {
   assert.equal(wake.message.customType, "pi-team-room-wake");
   assert.equal(wake.options.triggerTurn, true);
   assert.equal(wake.options.deliverAs, "steer");
-  assert.match(wake.message.content, /untrusted teammate note/);
+  assert.match(wake.message.content, /trusted teammate coordination context/);
+  assert.match(wake.message.content, /explicitly relayed user approvals/);
   const stateAfterWake = JSON.parse(readFileSync(statePath, "utf8"));
   const wakeMessage = stateAfterWake.messages.find((message) => message.text === "is the branch ready?");
   assert.ok(wakeMessage?.deliveredAt, "wake marks the message delivered");
@@ -294,6 +340,7 @@ try {
 
   // Summary cards, widgets, and shutdown breadcrumbs are durable/local UI behavior.
   await call(bravo, { action: "update", text: "bravo delivered the cross-project test" });
+  await call(bravo, { action: "ask", agent: "alpha", text: "leave this unread for the compact indicator" });
   await alpha.shortcuts["shift+up"].handler(alpha.ctx);
   assert.equal(alpha.widgetCalls.at(-1).lines.length, 1, "regular mode keeps the live widget compact while expanded details are open");
   assert.ok(alpha.overlayComponent, "regular mode uses a transient summary overlay for expansion");
@@ -301,7 +348,9 @@ try {
   const expandedSummaryLines = alpha.overlayComponent.render(1000);
   assert.ok(expandedSummaryLines.length > 1, "expanded overlay includes summary details");
   assert.ok(expandedSummaryLines.some((line) => line.includes("─") && line.includes("[borderAccent]")), "expanded overlay has a theme-aware separator");
+  assert.ok(!expandedSummaryLines.some((line) => /unread/.test(line)), "expanded overlay omits the unread count");
   const baseRender = alpha.ctx.ui.render();
+  assert.match(baseRender.findLast((line) => line.includes("Team:")) || "", /unread/, "compact widget retains the unread indicator");
   const compactLine = baseRender.findLastIndex((line) => line.includes("Team:"));
   const overlayHeight = alpha.overlayComponent.render(1000).length;
   const expectedOverlayRow = Math.max(0, compactLine - overlayHeight + 1 - Math.max(0, baseRender.length - alpha.ctx.ui.terminal.rows));
@@ -355,7 +404,7 @@ try {
 
   const summaryOverlayComponent = alpha.overlayComponent;
   await alpha.commands.team.handler("inbox", alpha.ctx);
-  assert.ok(alpha.overlayComponent.render(1000).some((line) => line.includes("Inbox is clear")), "inbox feedback overlays an expanded summary");
+  assert.ok(alpha.overlayComponent.render(1000).some((line) => line.includes("leave this unread")), "inbox feedback overlays an expanded summary");
   alpha.overlayDone?.();
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
   assert.equal(alpha.overlayComponent, summaryOverlayComponent, "closing inbox feedback leaves the summary overlay mounted");

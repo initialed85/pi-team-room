@@ -109,7 +109,24 @@ function start(statePath, port, peer) {
 }
 
 try {
-  await writeState(leftState, initialState("left-session", "desktop", "desktop update"));
+  const leftInitial = initialState("left-session", "desktop", "desktop update");
+  leftInitial.messages.push({
+    id: "delegation-desktop",
+    kind: "delegation",
+    fromSessionId: "left-session",
+    fromName: "desktop",
+    toSessionId: "right-session",
+    text: "Implement the networked handoff.",
+    delegation: {
+      target: "mqtt_things/pkg/service",
+      scope: "The service package only.",
+      userAuthorization: "Commit the scoped service fix.",
+      acceptanceChecks: "Run npm test.",
+      expectedArtifact: "Commit SHA",
+    },
+    createdAt: new Date().toISOString(),
+  });
+  await writeState(leftState, leftInitial);
   await writeState(rightState, initialState("right-session", "laptop", "laptop update"));
   start(leftState, leftPort, rightEndpoint);
   start(rightState, rightPort, leftEndpoint);
@@ -130,6 +147,10 @@ try {
   await waitFor("laptop update on desktop", async () => {
     const state = await (await request(leftEndpoint, "/v1/state")).json();
     return state.updates.some((item) => item.text === "laptop update");
+  });
+  await waitFor("structured delegation on laptop", async () => {
+    const state = await (await request(rightEndpoint, "/v1/state")).json();
+    return state.messages.some((item) => item.kind === "delegation" && item.delegation?.userAuthorization === "Commit the scoped service fix.");
   });
 
   const invalid = await request(leftEndpoint, "/v1/state", {

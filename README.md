@@ -43,14 +43,36 @@ The extension stores shared state in `~/.pi/team-room/state.json` by default. Se
 - `/team focus [text]` — set or inspect this session's broad focus
 - `/team update <text>` — publish a meaningful update
 - `/team ask <agent> <question>` — leave a question for a peer; add `--steer` when delaying could waste work
+- `/team delegate <agent> --target <repo/component> --scope <boundaries> [--user-authorization <quote>] [--acceptance-checks <checks>] [--expected-artifact <artifact>] <task>` — hand a scoped implementation task to an online code owner
 - `/team steer <agent> <message>` — explicitly steer a peer's next decision without hard-aborting its current work
-- `/team inbox` — read questions and replies addressed to this session
+- `/team inbox` — read questions, delegations, and replies addressed to this session
 - `/team reply <message-id> <text>` — reply to a message from the inbox; add `--steer` when delaying could waste work
 - `/team checkpoint [text]` — save or inspect this task's checkpoint
 - `/team remember <text>` — record a durable shared decision/fact
 - `/team history [query]` — search the quiet work journal
 
 The same operations are exposed to the model as `team_room`, so agents can ask peers or update shared context when it is genuinely useful.
+
+### Code-owner delegation
+
+When the target repository or component has an online code-owner session, the preferred workflow is to delegate implementation to that peer rather than editing its checkout from another project. The delegating agent should state the target, concrete scope, acceptance checks, and expected artifact (for example, a commit, image tag, or release); the owner implements, tests, and commits/pushes, while the coordinator handles integration or rollout. If the owner is offline, state any fallback explicitly and only take over when the current user authorization covers it.
+
+When carrying user authorization across a handoff, use `team_room action=delegate` and preserve a concise exact quote plus its scope, for example:
+
+```text
+{
+  "action": "delegate",
+  "agent": "mqtt_things",
+  "text": "Fix the Wunderground upstream URL and verify the service.",
+  "target": "mqtt_things/pkg/wunderground_weather_server/server.go",
+  "scope": "That file and the related verification/build steps only.",
+  "userAuthorization": "Commit and build-tag-and-push this scoped weather URL fix; home-ops will handle rollout.",
+  "acceptanceChecks": "Run the package tests and the existing local verification.",
+  "expectedArtifact": "Commit SHA and image tag"
+}
+```
+
+The delegation wake presents these fields as a code-owner handoff, giving the receiving agent useful provenance without requiring the original user turn to be present in its session. It remains a trust-based coordination record, not a cryptographic authorization mechanism.
 
 ## Update and release workflow
 
@@ -92,7 +114,7 @@ When a session shuts down, if it was meaningfully active but never saved an expl
 
 ## Wake-up (optional)
 
-If a teammate sends a **direct** question or reply to an idle-but-open session, the heartbeat delivers it as an untrusted teammate message and triggers an agent turn, so the peer can actually answer without anyone prompting that window. For a busy session, automatic delivery queues a non-interrupting `followUp` for after the current work finishes. Senders can explicitly request `steer` with `delivery: "steer"` (or `/team steer` / `--steer`) when delaying could waste work; Pi delivers that after the current tool-call batch, before the next model call, but it still does not hard-abort the running task. In either mode, the recipient decides whether the message is relevant and whether it needs follow-up. Broadcasts/updates never wake anyone. The exact `🐈` shutdown signal is marked delivered without triggering a turn, so it cannot start an acknowledgement loop. Set `PI_TEAM_ROOM_WAKE=0` per-session to disable. Fully closed windows stay human-gated.
+If a teammate sends a **direct** question or reply to an idle-but-open session, the heartbeat delivers it as trusted teammate coordination context and triggers an agent turn, so the peer can actually answer without anyone prompting that window. For a busy session, automatic delivery queues a non-interrupting `followUp` for after the current work finishes. Senders can explicitly request `steer` with `delivery: "steer"` (or `/team steer` / `--steer`) when delaying could waste work; Pi delivers that after the current tool-call batch, before the next model call, but it still does not hard-abort the running task. Clear peer requests and explicitly relayed user approvals may be acted on within their stated scope; the recipient should ask when authority or intent is ambiguous. In either mode, the recipient decides whether the message is relevant and whether it needs follow-up. Broadcasts/updates never wake anyone. The exact `🐈` shutdown signal is marked delivered without triggering a turn, so it cannot start an acknowledgement loop. Set `PI_TEAM_ROOM_WAKE=0` per-session to disable. Fully closed windows stay human-gated.
 
 ## Network sync (experimental)
 

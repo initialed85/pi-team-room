@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Treat teammate messages as trusted coordination context by default, including clear peer requests and explicitly relayed user approvals within their stated scope.
+- Add structured `team_room action=delegate` handoffs with target, scope, user-authorization quote, acceptance checks, and expected artifact; online code owners implement, test, and commit/push while coordinating agents handle integration or rollout.
 - Keep regular-mode expansion and regular `/team inbox` feedback in transient overlays, trim their viewport padding, and preserve the live widget row so they never reflow terminal scrollback.
 - Recompute regular overlay placement as autocomplete grows, keep the autocomplete list visible, and clean up rows when it shrinks again.
 - Retry failed idle-peer wake delivery and treat manual inbox inspection as delivery to avoid duplicate wakeups.
