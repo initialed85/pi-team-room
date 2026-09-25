@@ -19,7 +19,8 @@ const MAX_SESSIONS = 100;
 const HEARTBEAT_MS = Number(process.env.PI_TEAM_ROOM_HEARTBEAT_MS) || 30_000;
 const WAKE_ENABLED = process.env.PI_TEAM_ROOM_WAKE !== "0";
 const WAKE_MIN_GAP_MS = 20_000;
-const NETWORK_ENABLED = process.env.PI_TEAM_ROOM_NETWORK === "1";
+const NETWORK_MODE = process.env.PI_TEAM_ROOM_NETWORK || "0";
+const NETWORK_ENABLED = NETWORK_MODE === "1" || NETWORK_MODE === "irc";
 const NETWORK_SERVICE_PATH = fileURLToPath(new URL("./network-service.mjs", import.meta.url));
 const AUTO_CHECKPOINT_MIN_MS = (() => {
   const parsed = Number(process.env.PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS);
@@ -169,16 +170,21 @@ function statePath(): string {
 }
 
 function startNetworkService(): void {
-  if (!NETWORK_ENABLED || !process.env.PI_TEAM_ROOM_SHARED_SECRET) return;
+  if (!NETWORK_ENABLED) return;
+  if (NETWORK_MODE !== "irc" && !process.env.PI_TEAM_ROOM_SHARED_SECRET) return;
   const forwardedKeys = [
     "PI_TEAM_ROOM_STATE", "PI_TEAM_ROOM_PORT", "PI_TEAM_ROOM_BIND", "PI_TEAM_ROOM_SHARED_SECRET",
     "PI_TEAM_ROOM_PEERS", "PI_TEAM_ROOM_NODE_NAME", "PI_TEAM_ROOM_MDNS", "PI_TEAM_ROOM_MDNS_INTERFACE", "PI_TEAM_ROOM_SYNC_MS", "PI_TEAM_ROOM_NODE_GRACE_MS",
+    "PI_TEAM_ROOM_ADVERTISE_HOST", "PI_TEAM_ROOM_IRC_HOST", "PI_TEAM_ROOM_IRC_PORT", "PI_TEAM_ROOM_IRC_TLS",
+    "PI_TEAM_ROOM_IRC_CHANNEL", "PI_TEAM_ROOM_IRC_FOCUS_PREFIX", "PI_TEAM_ROOM_IRC_SERVER_PASSWORD",
+    "PI_TEAM_ROOM_IRC_TLS_REJECT_UNAUTHORIZED", "PI_TEAM_ROOM_IRC_RECONNECT_MS", "PI_TEAM_ROOM_IRC_POLL_MS",
+    "PI_TEAM_ROOM_IRC_NICK", "PI_TEAM_ROOM_IRC_USER",
   ];
   const env: NodeJS.ProcessEnv = { HOME: process.env.HOME, PATH: process.env.PATH };
   for (const key of forwardedKeys) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
-  env.PI_TEAM_ROOM_NETWORK = "1";
+  env.PI_TEAM_ROOM_NETWORK = NETWORK_MODE;
   env.PI_TEAM_ROOM_STATE ||= statePath();
   const child = spawn(process.execPath, [NETWORK_SERVICE_PATH], { detached: true, stdio: "ignore", env });
   child.on("error", () => undefined);
@@ -608,7 +614,6 @@ export default function (pi: ExtensionAPI) {
     try {
       if (!current) return;
       if (!WAKE_ENABLED) return;
-      if (Date.now() - lastAutoWakeAt < WAKE_MIN_GAP_MS) return;
       const idle = ctx.isIdle();
       const pending = (await loadState()).messages
         .filter((message) => message.toSessionId === current!.id && !message.deliveredAt &&
@@ -619,7 +624,8 @@ export default function (pi: ExtensionAPI) {
       // A done signal is deliberately passive: mark it delivered so it does not
       // wake the recipient, but leave it unread so it remains visible in the next
       // pulse/inbox. This makes the no-more-replies rule enforceable in addition
-      // to merely relying on the model prompt.
+      // to merely relying on the model prompt. Terminal signals are housekeeping,
+      // so they must not be blocked by the wake rate limiter.
       const doneSignals = pending.filter((message) => isDoneSignal(message.text));
       if (doneSignals.length > 0) {
         const doneIds = new Set(doneSignals.map((message) => message.id));
@@ -633,6 +639,7 @@ export default function (pi: ExtensionAPI) {
 
       const message = pending.find((item) => !isDoneSignal(item.text));
       if (!message) return;
+      if (Date.now() - lastAutoWakeAt < WAKE_MIN_GAP_MS) return;
       const deliveryAs: StoredMessageDelivery = message.delivery === "steer" || message.delivery === "followUp"
         ? message.delivery
         : idle ? "steer" : "followUp";

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add Claude Code/Codex stdio MCP support and an opt-in IRC network backend with public focus channels and targeted messaging.
 - Treat teammate messages as trusted coordination context by default, including clear peer requests and explicitly relayed user approvals within their stated scope.
 - Add structured `team_room action=delegate` handoffs with target, scope, user-authorization quote, acceptance checks, and expected artifact; online code owners implement, test, and commit/push while coordinating agents handle integration or rollout.
 - Keep regular-mode expansion and regular `/team inbox` feedback in transient overlays, trim their viewport padding, and preserve the live widget row so they never reflow terminal scrollback.

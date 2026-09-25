@@ -12,6 +12,8 @@ process.env.PI_TEAM_ROOM_STATE = statePath;
 process.env.PI_TEAM_ROOM_HEARTBEAT_MS = "25";
 process.env.PI_TEAM_ROOM_WAKE = "1";
 process.env.PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS = "1";
+// Keep a parent IRC/HTTP backend configuration out of this isolated harness.
+process.env.PI_TEAM_ROOM_NETWORK = "0";
 
 // Use Pi's own transpiler and bundled peer dependencies. The runtime network
 // dependency is installed from package.json; only core Pi peers need wiring for
@@ -331,7 +333,7 @@ try {
   const echo = makePeer("eeeeeeee-1111-2222-3333-444444444444", "echo", true, "/tmp/project-echo");
   await echo.handlers.session_start({}, echo.ctx);
   await call(alpha, { action: "ask", agent: "echo", text: "🐈" });
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
   assert.equal(echo.sendCalls.length, 0, "terminal signal does not wake a peer");
   const stateAfterDone = JSON.parse(readFileSync(statePath, "utf8"));
   const doneMessage = stateAfterDone.messages.find((message) => message.text === "🐈");
@@ -453,5 +455,5 @@ try {
 } finally {
   for (const link of madePeerLinks.reverse()) await rm(link, { recursive: true, force: true });
   if (madeModulesLink) await rm(localModules, { recursive: true, force: true });
-  await rm(stateDir, { recursive: true, force: true });
+  await rm(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 });
 }

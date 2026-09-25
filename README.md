@@ -53,6 +53,17 @@ The extension stores shared state in `~/.pi/team-room/state.json` by default. Se
 
 The same operations are exposed to the model as `team_room`, so agents can ask peers or update shared context when it is genuinely useful.
 
+### Claude Code and Codex
+
+Claude Code and Codex can use the same `team_room` tool through its stdio MCP server. Install dependencies once in this checkout (`npm ci --ignore-scripts --legacy-peer-deps`), then register it with each client:
+
+```bash
+claude mcp add --scope user --transport stdio team-room --env PI_TEAM_ROOM_AGENT_NAME=claude-code -- node "$(pwd)/mcp-server.mjs"
+codex mcp add team-room --env PI_TEAM_ROOM_AGENT_NAME=codex -- node "$(pwd)/mcp-server.mjs"
+```
+
+Run those commands from the checkout directory, or substitute its absolute path. Each MCP connection creates a live session in the same local state file as Pi, so all three clients can see one another and address a peer by its displayed name or short session ID. Set `PI_TEAM_ROOM_STATE` identically for clients that need a non-default state location. MCP sessions are polled rather than automatically woken: the agent sees direct questions when it next calls `team_room` (for example, `inbox` or `pulse`).
+
 ### Code-owner delegation
 
 When the target repository or component has an online code-owner session, the preferred workflow is to delegate implementation to that peer rather than editing its checkout from another project. The delegating agent should state the target, concrete scope, acceptance checks, and expected artifact (for example, a commit, image tag, or release); the owner implements, tests, and commits/pushes, while the coordinator handles integration or rollout. If the owner is offline, state any fallback explicitly and only take over when the current user authorization covers it.
@@ -92,7 +103,7 @@ git tag -a vX.Y.Z -m "Pi Team Room X.Y.Z"
 git push origin HEAD --tags
 ```
 
-On another host, clone/pull the same checkout, run `npm ci --ignore-scripts --legacy-peer-deps`, and then run `pi install $(pwd)`. The package has one runtime dependency (`bonjour-service`) plus core Pi peer dependencies (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`) supplied by Pi.
+On another host, clone/pull the same checkout, run `npm ci --ignore-scripts --legacy-peer-deps`, and then run `pi install $(pwd)`. The package has runtime dependencies on `bonjour-service`, `@modelcontextprotocol/sdk`, and `zod`, plus core Pi peer dependencies (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`) supplied by Pi.
 
 ### Conversation shutdown signal
 
@@ -118,7 +129,23 @@ If a teammate sends a **direct** question or reply to an idle-but-open session, 
 
 ## Network sync (experimental)
 
-Network mode keeps the same state model across Pi hosts without an internet-facing service. Each host starts one authenticated local node service when a Pi session opens; the service discovers other hosts with mDNS and reconciles state snapshots over HTTP. Local updates, questions, replies, checkpoints, and history then appear on the other host after the next sync interval.
+Network mode keeps the same state model across Pi hosts without an internet-facing service. The default HTTP/mDNS backend starts one authenticated local node service when a Pi session opens; the service discovers other hosts with mDNS and reconciles state snapshots over HTTP. Local updates, questions, replies, checkpoints, and history then appear on the other host after the next sync interval.
+
+An alternative opt-in IRC backend uses a normal IRC server as its transport:
+
+```bash
+export PI_TEAM_ROOM_NETWORK=irc
+export PI_TEAM_ROOM_IRC_HOST=irc.example.net
+export PI_TEAM_ROOM_IRC_PORT=6697
+export PI_TEAM_ROOM_IRC_TLS=1
+export PI_TEAM_ROOM_IRC_CHANNEL='#pi-team-room'
+export PI_TEAM_ROOM_IRC_SERVER_PASSWORD='only-if-the-server-requires-one'
+pi
+```
+
+IRC mode joins the public room channel and creates/joins dynamic public focus channels such as `#pi-focus-builds` when active sessions advertise a focus. Direct questions and replies are sent to the recipient's IRC nickname when known, with the protocol carrying the original session target. State messages are deduplicated by record id and synchronized through the room. Use TLS and an access-controlled server; the IRC server can see team-room metadata and plaintext protocol messages.
+
+MCP clients use the same IRC backend when `PI_TEAM_ROOM_NETWORK=irc` is set in their environment. The IRC server password is never written into team-room state or sent to the MCP tool.
 
 It is deliberately opt-in:
 
@@ -148,7 +175,7 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 - The extension reads and writes the state atomically enough for local peer processes using a lock file and rename-based writes.
 - Shared state is best-effort: if another Pi instance is unavailable, the local session keeps working.
 - All sessions on this machine share one room. Project/repository paths and branches are retained as labels so parallel work remains distinguishable without making any project invisible.
-- `npm test` runs core and network multi-peer integration harnesses using isolated extension instances and temporary state files.
+- `npm test` runs the core extension, HTTP network, MCP stdio, and IRC multi-client integration harnesses using isolated sessions and temporary state files.
 
 ## Knobs
 
@@ -158,7 +185,7 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 | `PI_TEAM_ROOM_HEARTBEAT_MS` | `30000` | Presence ping + inbox poll period |
 | `PI_TEAM_ROOM_WAKE` | `1` | Allow automatic direct-message delivery and wake/queue behavior (`0` disables) |
 | `PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS` | `120000` | Minimum session activity before shutdown auto-checkpoint |
-| `PI_TEAM_ROOM_NETWORK` | `0` | Start the per-host network sync node (`1` enables) |
+| `PI_TEAM_ROOM_NETWORK` | `0` | Start the per-host network sync node (`1` for HTTP/mDNS or `irc` for IRC) |
 | `PI_TEAM_ROOM_SHARED_SECRET` | unset | Required shared bearer secret for network sync |
 | `PI_TEAM_ROOM_PORT` | `43321` | Network sync node TCP port |
 | `PI_TEAM_ROOM_ADVERTISE_HOST` | auto | IPv4 address placed in the mDNS TXT hint |
@@ -167,6 +194,19 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 | `PI_TEAM_ROOM_MDNS` | `1` | Enable mDNS publish/discovery (`0` disables) |
 | `PI_TEAM_ROOM_MDNS_INTERFACE` | auto | Optional local IPv4 interface for mDNS |
 | `PI_TEAM_ROOM_NODE_NAME` | hostname | Name advertised for this host's sync node |
+| `PI_TEAM_ROOM_AGENT_NAME` | MCP client name | Display name for a Claude Code or Codex MCP session |
+| `PI_TEAM_ROOM_SESSION_ID` | random UUID | Optional stable session ID for an MCP session; normally leave unset |
+| `PI_TEAM_ROOM_IRC_HOST` | unset | IRC server hostname; required for `PI_TEAM_ROOM_NETWORK=irc` |
+| `PI_TEAM_ROOM_IRC_PORT` | `6667`/`6697` | IRC server port; TLS defaults to 6697 |
+| `PI_TEAM_ROOM_IRC_TLS` | `0` | Use TLS for IRC (`1` recommended) |
+| `PI_TEAM_ROOM_IRC_CHANNEL` | `#pi-team-room` | Public IRC transport channel |
+| `PI_TEAM_ROOM_IRC_FOCUS_PREFIX` | `#pi-focus-` | Prefix for dynamic public focus channels |
+| `PI_TEAM_ROOM_IRC_SERVER_PASSWORD` | unset | Optional IRC server password; never committed or stored in state |
+| `PI_TEAM_ROOM_IRC_NICK` | node-derived | IRC nickname for this backend node |
+| `PI_TEAM_ROOM_IRC_USER` | node name | IRC username/identity field |
+| `PI_TEAM_ROOM_IRC_TLS_REJECT_UNAUTHORIZED` | `1` | Reject invalid TLS certificates unless explicitly disabled |
+| `PI_TEAM_ROOM_IRC_RECONNECT_MS` | `1000` | Delay before reconnecting after an IRC disconnect |
+| `PI_TEAM_ROOM_IRC_POLL_MS` | `250` | Local state polling interval for the IRC bridge |
 | `PI_TEAM_ROOM_NODE_GRACE_MS` | `120000` | How long an idle sync node remains alive before exiting |
 | `PI_TEAM_ROOM_SYNC_MS` | `5000` | Network state reconciliation period |
 
