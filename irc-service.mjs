@@ -1,4 +1,4 @@
-import { createConnection } from "node:net";
+import { createConnection, isIP } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -232,6 +232,7 @@ let stopping = false;
 let ready = false;
 let input = "";
 let reconnectTimer;
+let reconnectResolve;
 let pollTimer;
 let pollInFlight = false;
 let published = new Map();
@@ -462,6 +463,7 @@ function connectOnce() {
     const options = { host: IRC_HOST, port: IRC_PORT };
     if (IRC_TLS) {
       options.rejectUnauthorized = IRC_TLS_REJECT_UNAUTHORIZED;
+      if (!isIP(IRC_HOST)) options.servername = IRC_HOST;
       socket = tlsConnect(options);
     } else {
       socket = createConnection(options);
@@ -497,7 +499,14 @@ async function run() {
   pollTimer.unref?.();
   while (!stopping) {
     await connectOnce();
-    if (!stopping) await new Promise((resolve) => { reconnectTimer = setTimeout(resolve, IRC_RECONNECT_MS); });
+    if (!stopping) await new Promise((resolve) => {
+      reconnectResolve = resolve;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = undefined;
+        reconnectResolve = undefined;
+        resolve();
+      }, IRC_RECONNECT_MS);
+    });
   }
 }
 
@@ -506,6 +515,9 @@ function stop() {
   stopping = true;
   clearInterval(pollTimer);
   clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
+  reconnectResolve?.();
+  reconnectResolve = undefined;
   socket?.destroy();
 }
 
