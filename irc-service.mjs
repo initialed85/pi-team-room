@@ -270,7 +270,9 @@ function endpointNickFromNode(node, session) {
   const nickPart = (value) => displayPart(value).replace(/\./g, "-").slice(0, 7).replace(/[-_]+$/g, "") || "agent";
   const host = nickPart(node.name);
   const agent = nickPart(process.env.PI_TEAM_ROOM_AGENT_NAME || session?.name || "agent");
-  const task = nickPart(String(session?.branch || basename(String(session?.project || "work"))).split("/").at(-1));
+  const branch = String(session?.branch || "").split("/").at(-1);
+  const project = basename(String(session?.project || "work"));
+  const task = nickPart(branch && !["main", "master", "develop"].includes(branch.toLowerCase()) ? branch : project);
   return sanitizeNick(`${host}-${agent}-${task}-${suffix}`);
 }
 

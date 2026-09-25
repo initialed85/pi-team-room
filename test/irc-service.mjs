@@ -129,9 +129,9 @@ try {
   let left = state("left-session", "left", "builds");
   left.sessions.push(session("local-session-charlie", "local", "planning"));
   const right = state("right-session", "right", "reviews");
-  const leftNick = "host-te-left-main-ession";
-  const localNick = "host-te-local-main-harlie";
-  const rightNick = "other-h-right-main-ession";
+  const leftNick = "host-te-left-left-ession";
+  const localNick = "host-te-local-local-harlie";
+  const rightNick = "other-h-right-right-ession";
   await writeState(leftPath, left);
   await writeState(rightPath, right);
   start(leftPath, "left-session", "host-test");
