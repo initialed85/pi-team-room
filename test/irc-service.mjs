@@ -106,11 +106,17 @@ await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const port = server.address().port;
 const children = [];
 
+function broadcast(channel, text) {
+  for (const client of clients) {
+    if (client.channels.has(channel)) client.socket.write(`:legacy!user@mock PRIVMSG ${channel} :${text}\r\n`);
+  }
+}
+
 function start(statePath, nick) {
   const child = spawn(process.execPath, [servicePath], {
     env: { ...process.env, PI_TEAM_ROOM_NETWORK: "irc", PI_TEAM_ROOM_STATE: statePath,
       PI_TEAM_ROOM_IRC_HOST: "127.0.0.1", PI_TEAM_ROOM_IRC_PORT: String(port), PI_TEAM_ROOM_IRC_NICK: nick,
-      PI_TEAM_ROOM_IRC_CHANNEL: "#pi-test", PI_TEAM_ROOM_IRC_FOCUS_PREFIX: "#pi-focus-",
+      PI_TEAM_ROOM_IRC_CHANNEL: "#pi-test", PI_TEAM_ROOM_IRC_SYNC_CHANNEL: "#pi-test-sync-v2", PI_TEAM_ROOM_IRC_FOCUS_PREFIX: "#pi-focus-",
       PI_TEAM_ROOM_IRC_POLL_MS: "40", PI_TEAM_ROOM_IRC_RECONNECT_MS: "40", PI_TEAM_ROOM_IRC_TLS: "0" },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -133,10 +139,18 @@ try {
 
   await waitFor("both IRC clients and initial focus channel", () =>
     joins.some((item) => item.nick === "room-left" && item.channel === "#pi-test") &&
+    joins.some((item) => item.nick === "room-left" && item.channel === "#pi-test-sync-v2") &&
     joins.some((item) => item.nick === "room-right" && item.channel === "#pi-test") &&
+    joins.some((item) => item.nick === "room-right" && item.channel === "#pi-test-sync-v2") &&
     joins.some((item) => item.channel === "#pi-focus-builds") &&
     joins.some((item) => item.channel === "#pi-focus-reviews"));
 
+  const legacyUpdate = { v: 1, origin: "legacy-node", kind: "record", recordType: "update",
+    record: { id: "legacy-main-update", sessionId: "legacy", sessionName: "legacy", project: "/tmp", text: "must be ignored", createdAt: new Date().toISOString() } };
+  broadcast("#pi-test", `PI_TEAM_ROOM/1 ${Buffer.from(JSON.stringify(legacyUpdate)).toString("base64url")}`);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal((await readState(leftPath)).updates.some((item) => item.id === "legacy-main-update"), false,
+    "protocol history in the human-facing room is ignored");
   left = await readState(leftPath);
   left.updates.push({ id: "left-update", sessionId: "left-session", sessionName: "left", project: "/tmp/left", text: "left update", createdAt: new Date().toISOString() });
   await writeState(leftPath, left);
@@ -147,6 +161,10 @@ try {
   await writeState(leftPath, left);
   await waitFor("direct question propagation", async () => (await readState(rightPath)).messages.some((item) => item.text === "direct question"));
   assert.ok(messages.some((item) => item.from === "room-left" && item.target === "room-right"), "targeted messages use the recipient IRC nick");
+  assert.ok(messages.some((item) => item.target === "#pi-test" && item.text.startsWith("[focus]")),
+    "human-facing room receives readable focus announcements");
+  assert.equal(messages.some((item) => item.target === "#pi-test" && item.text.startsWith("PI_TEAM_ROOM/1")), false,
+    "machine protocol payloads stay off the human-facing room");
 
   right.messages.push({ id: "right-reply", kind: "reply", fromSessionId: "right-session", fromName: "right",
     toSessionId: "left-session", replyToId: "left-message", text: "direct reply", createdAt: new Date().toISOString() });

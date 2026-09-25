@@ -14,6 +14,7 @@ const IRC_HOST = process.env.PI_TEAM_ROOM_IRC_HOST || "";
 const IRC_TLS = process.env.PI_TEAM_ROOM_IRC_TLS === "1";
 const IRC_PORT = Number(process.env.PI_TEAM_ROOM_IRC_PORT) || (IRC_TLS ? 6697 : 6667);
 const IRC_CHANNEL = normalizeChannel(process.env.PI_TEAM_ROOM_IRC_CHANNEL || "#pi-team-room");
+const IRC_SYNC_CHANNEL = normalizeChannel(process.env.PI_TEAM_ROOM_IRC_SYNC_CHANNEL || `${IRC_CHANNEL}-sync-v2`);
 const IRC_FOCUS_PREFIX = normalizeChannelPrefix(process.env.PI_TEAM_ROOM_IRC_FOCUS_PREFIX || "#pi-focus-");
 const IRC_SERVER_PASSWORD = process.env.PI_TEAM_ROOM_IRC_SERVER_PASSWORD || "";
 const IRC_TLS_REJECT_UNAUTHORIZED = process.env.PI_TEAM_ROOM_IRC_TLS_REJECT_UNAUTHORIZED !== "0";
@@ -285,6 +286,7 @@ let published = new Map();
 let joinedChannels = new Set();
 const sessionRoutes = new Map();
 const snapshotChunks = new Map();
+const readableSessionSignatures = new Map();
 
 function sendRaw(command) {
   if (!socket || socket.destroyed) return;
@@ -296,6 +298,13 @@ function sendPrivmsg(target, text) {
   const line = `PRIVMSG ${target} :${text}`;
   if (Buffer.byteLength(`${line}\r\n`, "utf8") > 510) return;
   sendRaw(line);
+}
+
+function sendPublicText(target, text) {
+  const prefix = `PRIVMSG ${target} :`;
+  let content = [...String(text || "").replace(/[\r\n\0]/g, " ").replace(/\s+/g, " ")];
+  while (content.length > 0 && Buffer.byteLength(`${prefix}${content.join("")}\r\n`, "utf8") > 510) content.pop();
+  if (content.length > 0) sendRaw(`${prefix}${content.join("")}`);
 }
 
 function sendProtocol(target, value) {
@@ -319,7 +328,7 @@ function joinChannel(channel) {
 }
 
 function partChannel(channel) {
-  if (!ready || channel === IRC_CHANNEL || !joinedChannels.has(channel)) return;
+  if (!ready || channel === IRC_CHANNEL || channel === IRC_SYNC_CHANNEL || !joinedChannels.has(channel)) return;
   joinedChannels.delete(channel);
   sendRaw(`PART ${channel}`);
 }
@@ -333,7 +342,7 @@ function syncFocusChannels(state) {
   const desired = channelsForState(state);
   for (const channel of desired) joinChannel(channel);
   for (const channel of [...joinedChannels]) {
-    if (channel !== IRC_CHANNEL && !desired.has(channel)) partChannel(channel);
+    if (channel !== IRC_CHANNEL && channel !== IRC_SYNC_CHANNEL && !desired.has(channel)) partChannel(channel);
   }
 }
 
@@ -352,6 +361,18 @@ function localSessionEvent(record) {
   return { kind: "record", recordType: "session", record, nodeId: node.id, nick };
 }
 
+function publishReadableSession(record) {
+  const focus = String(record.focus || record.checkpoint?.text || "").trim().replace(/\s+/g, " ");
+  const state = record.connected === false ? "left" : "active";
+  const signature = JSON.stringify([record.name, focus, state]);
+  if (readableSessionSignatures.get(record.id) === signature) return;
+  readableSessionSignatures.set(record.id, signature);
+  const summary = `${record.name} [${record.id.slice(0, 8)}] ${state}: ${focus || "no focus recorded"}`;
+  sendPublicText(IRC_CHANNEL, `[focus] ${summary}`);
+  const channel = focusChannel(record.focus);
+  if (channel) sendPublicText(channel, summary);
+}
+
 function sendRecord(recordType, record) {
   const event = recordType === "session" ? localSessionEvent(record) : { kind: "record", recordType, record };
   if (recordType === "message" && record.toSessionId) {
@@ -361,10 +382,10 @@ function sendRecord(recordType, record) {
       return;
     }
   }
-  sendProtocol(IRC_CHANNEL, event);
-  if (recordType === "session") {
-    const channel = focusChannel(record.focus);
-    if (channel) sendProtocol(channel, event);
+  sendProtocol(IRC_SYNC_CHANNEL, event);
+  if (recordType === "session") publishReadableSession(record);
+  if (recordType === "update" && !String(record.sessionId || "").startsWith("irc:")) {
+    sendPublicText(IRC_CHANNEL, `[update] ${record.sessionName}: ${record.text}`);
   }
 }
 
@@ -510,9 +531,10 @@ function handleLine(line) {
   if (parsed.command === "001") {
     ready = true;
     joinChannel(IRC_CHANNEL);
+    joinChannel(IRC_SYNC_CHANNEL);
     void announceSessions().then(() => {
-      sendProtocol(IRC_CHANNEL, { kind: "hello", nodeId: node.id, nick });
-      sendProtocol(IRC_CHANNEL, { kind: "request" });
+      sendProtocol(IRC_SYNC_CHANNEL, { kind: "hello", nodeId: node.id, nick });
+      sendProtocol(IRC_SYNC_CHANNEL, { kind: "request" });
     }).catch(() => undefined);
     return;
   }
@@ -523,6 +545,7 @@ function handleLine(line) {
   }
   if (parsed.command === "PRIVMSG") {
     const target = parsed.params[0];
+    if ((target?.startsWith("#") || target?.startsWith("&")) && target.toLowerCase() !== IRC_SYNC_CHANNEL.toLowerCase()) return;
     const sourceNick = nickFromPrefix(parsed.prefix);
     void handleProtocol(target, sourceNick, parsed.params[1] || "");
   }
