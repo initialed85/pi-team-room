@@ -134,6 +134,7 @@ type TeamUpdate = {
 
 type JournalItem = {
   id: string;
+  sessionId?: string;
   project: string;
   text: string;
   createdAt: string;
@@ -169,7 +170,7 @@ function statePath(): string {
   return process.env[STATE_ENV] || DEFAULT_STATE_PATH;
 }
 
-function startNetworkService(): void {
+function startNetworkService(sessionId: string): void {
   if (!NETWORK_ENABLED) return;
   if (NETWORK_MODE !== "irc" && !process.env.PI_TEAM_ROOM_SHARED_SECRET) return;
   const forwardedKeys = [
@@ -186,6 +187,7 @@ function startNetworkService(): void {
   }
   env.PI_TEAM_ROOM_NETWORK = NETWORK_MODE;
   env.PI_TEAM_ROOM_STATE ||= statePath();
+  env.PI_TEAM_ROOM_SESSION_ID = sessionId;
   const child = spawn(process.execPath, [NETWORK_SERVICE_PATH], { detached: true, stdio: "ignore", env });
   child.on("error", () => undefined);
   child.unref();
@@ -1181,8 +1183,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     projectInfo = undefined;
-    await ensureSession(ctx, "idle");
-    startNetworkService();
+    const session = await ensureSession(ctx, "idle");
+    startNetworkService(session.id);
     await refreshWidget(ctx);
     heartbeat = setInterval(() => {
       // Heartbeat work is best-effort. A session can shut down while one of
@@ -1307,7 +1309,7 @@ export default function (pi: ExtensionAPI) {
           const clean = truncate(params.text || "", MAX_UPDATE_LENGTH);
           if (!clean) return toolResult("remember", "A fact or decision is required.");
           await updateState((state) => {
-            state.journal.unshift({ id: randomUUID(), project: session.project, text: clean, createdAt: now(), sessionName: session.name });
+            state.journal.unshift({ id: randomUUID(), sessionId: session.id, project: session.project, text: clean, createdAt: now(), sessionName: session.name });
             state.journal = state.journal.slice(0, 500);
           });
           return toolResult("remember", `Saved to shared history: ${clean}`);
@@ -1378,7 +1380,7 @@ export default function (pi: ExtensionAPI) {
         } else if (subcommand === "remember") {
           const clean = truncate(text, MAX_UPDATE_LENGTH);
           if (!clean) throw new Error("Usage: /team remember <fact or decision>");
-          await updateState((state) => { state.journal.unshift({ id: randomUUID(), project: session.project, text: clean, createdAt: now(), sessionName: session.name }); });
+          await updateState((state) => { state.journal.unshift({ id: randomUUID(), sessionId: session.id, project: session.project, text: clean, createdAt: now(), sessionName: session.name }); });
           ctx.ui.notify(`Saved to shared history: ${clean}`, "info");
         } else if (subcommand === "history") {
           ctx.ui.notify(renderHistory(searchJournal(await loadState(), session, text)), "info");

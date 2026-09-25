@@ -249,6 +249,7 @@ function startNetworkService() {
   for (const key of forwardedKeys) if (process.env[key] !== undefined) env[key] = process.env[key];
   env.PI_TEAM_ROOM_NETWORK = networkMode;
   env.PI_TEAM_ROOM_STATE ||= STATE_PATH;
+  if (current) env.PI_TEAM_ROOM_SESSION_ID = current.id;
   networkService = import("node:child_process").then(({ spawn }) => {
     const child = spawn(process.execPath, [NETWORK_SERVICE_PATH], { detached: true, stdio: "ignore", env });
     child.on("error", (error) => console.error("pi-team-room: network service failed to start:", error.message));
@@ -393,7 +394,7 @@ async function runAction(params) {
       const clean = truncate(params.text, MAX_UPDATE_LENGTH);
       if (!clean) throw new Error("A fact or decision is required.");
       await withState((state) => {
-        state.journal.unshift({ id: randomUUID(), project: session.project, text: clean, createdAt: now(), sessionName: session.name });
+        state.journal.unshift({ id: randomUUID(), sessionId: session.id, project: session.project, text: clean, createdAt: now(), sessionName: session.name });
         state.journal = state.journal.slice(0, 500);
       });
       return `Saved to shared history: ${clean}`;

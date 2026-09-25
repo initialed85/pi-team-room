@@ -20,7 +20,8 @@ const IRC_SERVER_PASSWORD = process.env.PI_TEAM_ROOM_IRC_SERVER_PASSWORD || "";
 const IRC_TLS_REJECT_UNAUTHORIZED = process.env.PI_TEAM_ROOM_IRC_TLS_REJECT_UNAUTHORIZED !== "0";
 const IRC_RECONNECT_MS = Number(process.env.PI_TEAM_ROOM_IRC_RECONNECT_MS) || 1_000;
 const IRC_NODE_GRACE_MS = Number(process.env.PI_TEAM_ROOM_IRC_NODE_GRACE_MS) || 120_000;
-const INSTANCE_LOCK_PATH = `${STATE_PATH}.irc-service.lock`;
+const LOCAL_SESSION_ID = process.env.PI_TEAM_ROOM_SESSION_ID || "";
+const INSTANCE_LOCK_PATH = `${STATE_PATH}.irc-service.${sanitizeUser(LOCAL_SESSION_ID || "missing-session")}.lock`;
 const INSTANCE_LOCK_TOKEN = `${process.pid}:${randomUUID()}`;
 const IRC_USER = sanitizeUser(process.env.PI_TEAM_ROOM_IRC_USER || process.env.PI_TEAM_ROOM_NODE_NAME || hostname());
 const MAX_SESSIONS = 100;
@@ -34,6 +35,10 @@ const MAX_IRC_PAYLOAD = 240;
 if (NETWORK_MODE !== "irc") process.exit(0);
 if (!IRC_HOST) {
   console.error("pi-team-room IRC backend: set PI_TEAM_ROOM_IRC_HOST");
+  process.exit(1);
+}
+if (!LOCAL_SESSION_ID) {
+  console.error("pi-team-room IRC backend: set PI_TEAM_ROOM_SESSION_ID");
   process.exit(1);
 }
 
@@ -94,7 +99,8 @@ function sanitizeUser(value) {
 }
 
 function sanitizeNick(value) {
-  return sanitizeUser(value).slice(0, 30) || "pi-team-room";
+  const sanitized = String(value || "pi-team-room").replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 30) || "pi-team-room";
+  return /^[A-Za-z_]/.test(sanitized) ? sanitized : `pi-${sanitized}`.slice(0, 30);
 }
 
 function now() {
@@ -257,25 +263,66 @@ function nickFromPrefix(prefix) {
   return String(prefix || "").split("!", 1)[0];
 }
 
-function endpointNickFromNode(node) {
-  return sanitizeNick(process.env.PI_TEAM_ROOM_IRC_NICK || `${node.name}-team`);
+function endpointNickFromNode(node, session) {
+  const suffix = LOCAL_SESSION_ID.replace(/[^A-Za-z0-9]/g, "").slice(-6) || "agent";
+  const configuredNick = process.env.PI_TEAM_ROOM_IRC_NICK;
+  if (configuredNick) return sanitizeNick(`${sanitizeUser(configuredNick).slice(0, 23)}-${suffix}`);
+  const nickPart = (value) => displayPart(value).replace(/\./g, "-").slice(0, 7).replace(/[-_]+$/g, "") || "agent";
+  const host = nickPart(node.name);
+  const agent = nickPart(process.env.PI_TEAM_ROOM_AGENT_NAME || session?.name || "agent");
+  const task = nickPart(String(session?.branch || basename(String(session?.project || "work"))).split("/").at(-1));
+  return sanitizeNick(`${host}-${agent}-${task}-${suffix}`);
 }
 
 const nodePath = join(dirname(STATE_PATH), `.${basename(STATE_PATH)}.irc-node.json`);
-let node;
-try {
-  node = JSON.parse(await readFile(nodePath, "utf8"));
-} catch {
-  node = undefined;
-}
-if (!node || typeof node.id !== "string") node = { id: randomUUID(), name: hostname() };
-const configuredNodeName = process.env.PI_TEAM_ROOM_NODE_NAME?.trim();
-if (configuredNodeName) node.name = configuredNodeName;
-else if (typeof node.name !== "string" || !node.name.trim()) node.name = hostname();
-await mkdir(dirname(nodePath), { recursive: true });
-await writeFile(nodePath, `${JSON.stringify(node, null, 2)}\n`, { mode: 0o600 });
 
-let nick = endpointNickFromNode(node);
+async function loadNode() {
+  const lockPath = `${nodePath}.lock`;
+  await mkdir(dirname(nodePath), { recursive: true });
+  let locked = false;
+  for (let attempt = 0; attempt < 100 && !locked; attempt++) {
+    try {
+      await writeFile(lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+      locked = true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let lockPid;
+      try { lockPid = Number((await readFile(lockPath, "utf8")).trim()); } catch { lockPid = undefined; }
+      if (Number.isInteger(lockPid) && lockPid > 0) {
+        try { process.kill(lockPid, 0); } catch (processError) {
+          if (processError?.code === "ESRCH") await unlink(lockPath).catch(() => undefined);
+          else if (processError?.code !== "EPERM") throw processError;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  if (!locked) throw new Error("could not acquire the host IRC identity lock");
+  try {
+    let node;
+    try { node = JSON.parse(await readFile(nodePath, "utf8")); } catch { node = undefined; }
+    if (!node || typeof node.id !== "string") node = { id: randomUUID(), name: hostname() };
+    const configuredNodeName = process.env.PI_TEAM_ROOM_NODE_NAME?.trim();
+    if (configuredNodeName) node.name = configuredNodeName;
+    else if (typeof node.name !== "string" || !node.name.trim()) node.name = hostname();
+    const temp = `${nodePath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temp, `${JSON.stringify(node, null, 2)}\n`, { mode: 0o600 });
+    await rename(temp, nodePath);
+    return node;
+  } finally {
+    await unlink(lockPath).catch(() => undefined);
+  }
+}
+
+const node = await loadNode();
+
+const initialState = await loadState();
+const localSession = initialState.sessions.find((session) => session.id === LOCAL_SESSION_ID);
+if (!localSession) {
+  console.error("pi-team-room IRC backend: session is missing from PI_TEAM_ROOM_STATE");
+  process.exit(1);
+}
+let nick = endpointNickFromNode(node, localSession);
 let socket;
 let stopping = false;
 let ready = false;
@@ -288,7 +335,8 @@ let noSessionsSince;
 let pollInFlight = false;
 let published = new Map();
 let joinedChannels = new Set();
-const sessionRoutes = new Map();
+const sessionRoutes = new Map(initialState.sessions.filter((session) => session.ircNodeId && session.ircNick)
+  .map((session) => [session.id, { nodeId: session.ircNodeId, nick: session.ircNick }]));
 const snapshotChunks = new Map();
 const readableSessionSignatures = new Map();
 
@@ -338,7 +386,8 @@ function partChannel(channel) {
 }
 
 function channelsForState(state) {
-  return new Set(state.sessions.filter(activeSession).map((session) => focusChannel(session.focus)).filter(Boolean));
+  return new Set(state.sessions.filter((session) => session.id === LOCAL_SESSION_ID && activeSession(session))
+    .map((session) => focusChannel(session.focus)).filter(Boolean));
 }
 
 function syncFocusChannels(state) {
@@ -380,6 +429,18 @@ function updateLabel(record) {
   return `${displayPart(node.name)}-${displayPart(record.sessionName)}-${project}-${String(record.sessionId || "session").slice(0, 6)}`;
 }
 
+async function updateLocalNickname(session) {
+  const nextNick = endpointNickFromNode(node, session);
+  if (nextNick === nick) return;
+  nick = nextNick;
+  session.ircNick = nick;
+  sessionRoutes.set(session.id, { nodeId: node.id, nick });
+  await withState((state) => {
+    state.sessions = state.sessions.map((item) => item.id === LOCAL_SESSION_ID ? { ...item, ircNick: nick } : item);
+  });
+  sendRaw(`NICK ${nick}`);
+}
+
 function publishReadableSession(record) {
   const focus = String(record.focus || record.checkpoint?.text || "").trim().replace(/\s+/g, " ");
   const state = record.connected === false ? "left" : "active";
@@ -396,7 +457,8 @@ function sendRecord(recordType, record) {
   const event = recordType === "session" ? localSessionEvent(record) : { kind: "record", recordType, record };
   if (recordType === "message" && record.toSessionId) {
     const route = sessionRoutes.get(record.toSessionId);
-    if (route && route.nodeId !== node.id) {
+    if (route?.nodeId === node.id) return;
+    if (route) {
       sendProtocol(route.nick, event);
       return;
     }
@@ -410,12 +472,11 @@ function sendRecord(recordType, record) {
 
 async function claimUnownedActiveSessions() {
   let state = await loadState();
-  const unowned = state.sessions.filter((session) => activeSession(session) && !session.ircNodeId);
-  if (unowned.length === 0) return state;
-  const unownedIds = new Set(unowned.map((session) => session.id));
+  const localSession = state.sessions.find((session) => session.id === LOCAL_SESSION_ID);
+  if (!localSession || !activeSession(localSession) || (localSession.ircNodeId === node.id && localSession.ircNick === nick)) return state;
   await withState((current) => {
     current.sessions = current.sessions.map((session) =>
-      unownedIds.has(session.id) && !session.ircNodeId ? { ...session, ircNodeId: node.id } : session);
+      session.id === LOCAL_SESSION_ID ? { ...session, ircNodeId: node.id, ircNick: nick } : session);
   });
   state = await loadState();
   return state;
@@ -424,12 +485,18 @@ async function claimUnownedActiveSessions() {
 async function announceSessions() {
   const state = await claimUnownedActiveSessions();
   syncFocusChannels(state);
-  for (const session of state.sessions.filter(activeSession)) {
-    if (session.ircNodeId !== node.id) continue;
+  const session = state.sessions.find((item) => item.id === LOCAL_SESSION_ID && activeSession(item));
+  if (session && session.ircNodeId === node.id) {
     sendRecord("session", session);
     sessionRoutes.set(session.id, { nodeId: node.id, nick });
     published.set(`session:${session.id}`, recordSignature(session));
   }
+}
+
+function belongsToLocalSession(recordType, record) {
+  if (recordType === "session") return record.id === LOCAL_SESSION_ID;
+  if (recordType === "message") return record.fromSessionId === LOCAL_SESSION_ID;
+  return record.sessionId === LOCAL_SESSION_ID;
 }
 
 async function publishLocalChanges() {
@@ -443,6 +510,8 @@ async function publishLocalChanges() {
   ];
   for (const [recordType, records] of groups) {
     for (const record of records) {
+      if (!belongsToLocalSession(recordType, record)) continue;
+      if (recordType === "session") await updateLocalNickname(record);
       const key = `${recordType}:${record.id}`;
       const signature = recordSignature(record);
       if (published.get(key) === signature) continue;
@@ -467,14 +536,14 @@ async function mergeRemoteState(remote, sourceNick, origin) {
   });
   markPublished(incoming);
   for (const session of incoming.sessions) {
-    if (session.ircNodeId === origin) sessionRoutes.set(session.id, { nodeId: origin, nick: sourceNick });
+    if (session.ircNodeId === origin) sessionRoutes.set(session.id, { nodeId: origin, nick: session.ircNick || sourceNick });
   }
   syncFocusChannels(incoming);
 }
 
-async function applyRecord(recordType, record, origin) {
+async function applyRecord(recordType, record, origin, sourceNick) {
   if (!record || typeof record.id !== "string") return;
-  const incoming = recordType === "session" && origin ? { ...record, ircNodeId: origin } : record;
+  const incoming = recordType === "session" && origin ? { ...record, ircNodeId: origin, ircNick: sourceNick } : record;
   await withState((state) => {
     const groups = { session: "sessions", message: "messages", update: "updates", journal: "journal" };
     const field = groups[recordType];
@@ -483,7 +552,10 @@ async function applyRecord(recordType, record, origin) {
     const index = records.findIndex((item) => item.id === incoming.id);
     if (index >= 0) {
       records[index] = mergeRecord(records[index], incoming);
-      if (recordType === "session" && origin) records[index].ircNodeId = origin;
+      if (recordType === "session" && origin) {
+        records[index].ircNodeId = origin;
+        records[index].ircNick = sourceNick;
+      }
     } else records.push(incoming);
     state[field] = records.slice(-({ sessions: MAX_SESSIONS, messages: MAX_MESSAGES, updates: MAX_UPDATES, journal: MAX_JOURNAL }[field]));
   });
@@ -495,8 +567,31 @@ async function sendSnapshot(target) {
   sendProtocol(target, { kind: "snapshot", state: await loadState() });
 }
 
+async function claimSnapshotAction(action, peerId) {
+  const path = `${STATE_PATH}.irc-snapshot-${action}-${sanitizeUser(peerId)}.lock`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await writeFile(path, `${Date.now()}\n`, { flag: "wx", mode: 0o600 });
+      return true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let claimedAt;
+      try { claimedAt = Number((await readFile(path, "utf8")).trim()); } catch { claimedAt = 0; }
+      if (Date.now() - claimedAt < 60_000) return false;
+      await unlink(path).catch(() => undefined);
+    }
+  }
+  return false;
+}
+
 async function receiveProtocol(target, sourceNick, value) {
-  if (!value || value.v !== PROTOCOL_VERSION || value.origin === node.id) return;
+  if (!value || value.v !== PROTOCOL_VERSION) return;
+  if (value.origin === node.id) {
+    if (value.kind === "record" && value.recordType === "session" && value.record?.id) {
+      sessionRoutes.set(value.record.id, { nodeId: node.id, nick: sourceNick });
+    }
+    return;
+  }
   if (value.kind === "chunk") {
     const key = `${sourceNick}:${value.id}`;
     const chunks = snapshotChunks.get(key) || { total: value.total, data: [] };
@@ -509,11 +604,13 @@ async function receiveProtocol(target, sourceNick, value) {
   }
   if (value.kind === "hello") {
     if (value.nodeId && value.nick) sessionRoutes.set(`node:${value.nodeId}`, { nodeId: value.nodeId, nick: value.nick });
-    sendProtocol(sourceNick, { kind: "request" });
+    if (value.nodeId && await claimSnapshotAction("request", value.nodeId)) {
+      sendProtocol(sourceNick, { kind: "request" });
+    }
     return;
   }
   if (value.kind === "request") {
-    await sendSnapshot(sourceNick);
+    if (await claimSnapshotAction("response", value.origin)) await sendSnapshot(sourceNick);
     return;
   }
   if (value.kind === "snapshot") {
@@ -526,7 +623,7 @@ async function receiveProtocol(target, sourceNick, value) {
     }
     const state = await loadState();
     if (value.recordType === "message" && value.record?.toSessionId && !state.sessions.some((item) => item.id === value.record.toSessionId)) return;
-    await applyRecord(value.recordType, value.record, value.origin);
+    await applyRecord(value.recordType, value.record, value.origin, sourceNick);
   }
 }
 
@@ -553,12 +650,15 @@ function handleLine(line) {
     joinChannel(IRC_SYNC_CHANNEL);
     void announceSessions().then(() => {
       sendProtocol(IRC_SYNC_CHANNEL, { kind: "hello", nodeId: node.id, nick });
-      sendProtocol(IRC_SYNC_CHANNEL, { kind: "request" });
     }).catch(() => undefined);
     return;
   }
   if (parsed.command === "433") {
-    nick = sanitizeNick(`${endpointNickFromNode(node)}-${Math.floor(Math.random() * 999)}`);
+    nick = sanitizeNick(`${endpointNickFromNode(node, localSession).slice(0, 25)}-${Math.floor(Math.random() * 999)}`);
+    sessionRoutes.set(LOCAL_SESSION_ID, { nodeId: node.id, nick });
+    void withState((state) => {
+      state.sessions = state.sessions.map((session) => session.id === LOCAL_SESSION_ID ? { ...session, ircNick: nick } : session);
+    }).catch(() => undefined);
     sendRaw(`NICK ${nick}`);
     return;
   }
@@ -609,7 +709,7 @@ function connectOnce() {
 
 async function checkNodeLease() {
   const state = await loadState();
-  if (state.sessions.some(activeSession)) {
+  if (state.sessions.some((session) => session.id === LOCAL_SESSION_ID && activeSession(session))) {
     noSessionsSince = undefined;
     return;
   }

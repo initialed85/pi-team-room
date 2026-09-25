@@ -112,37 +112,48 @@ function broadcast(channel, text) {
   }
 }
 
-function start(statePath, nick) {
+function start(statePath, sessionId, hostName) {
   const child = spawn(process.execPath, [servicePath], {
-    env: { ...process.env, PI_TEAM_ROOM_NETWORK: "irc", PI_TEAM_ROOM_STATE: statePath,
-      PI_TEAM_ROOM_IRC_HOST: "127.0.0.1", PI_TEAM_ROOM_IRC_PORT: String(port), PI_TEAM_ROOM_IRC_NICK: nick,
+    env: { ...process.env, PI_TEAM_ROOM_NETWORK: "irc", PI_TEAM_ROOM_STATE: statePath, PI_TEAM_ROOM_SESSION_ID: sessionId,
+      PI_TEAM_ROOM_NODE_NAME: hostName, PI_TEAM_ROOM_IRC_HOST: "127.0.0.1", PI_TEAM_ROOM_IRC_PORT: String(port),
       PI_TEAM_ROOM_IRC_CHANNEL: "#pi-test", PI_TEAM_ROOM_IRC_SYNC_CHANNEL: "#pi-test-sync-v2", PI_TEAM_ROOM_IRC_FOCUS_PREFIX: "#pi-focus-",
       PI_TEAM_ROOM_IRC_POLL_MS: "40", PI_TEAM_ROOM_IRC_RECONNECT_MS: "40", PI_TEAM_ROOM_IRC_TLS: "0" },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  child.stderr.on("data", (chunk) => console.error(`IRC ${sessionId}: ${chunk}`));
   children.push(child);
   return child;
 }
 
 try {
   let left = state("left-session", "left", "builds");
+  left.sessions.push(session("local-session-charlie", "local", "planning"));
   const right = state("right-session", "right", "reviews");
+  const leftNick = "host-te-left-main-ession";
+  const localNick = "host-te-local-main-harlie";
+  const rightNick = "other-h-right-main-ession";
   await writeState(leftPath, left);
   await writeState(rightPath, right);
-  start(leftPath, "room-left");
-  await waitFor("first host bridge", () => joins.some((item) => item.nick === "room-left" && item.channel === "#pi-test"));
-  const duplicateBridge = start(leftPath, "room-left");
-  await waitFor("duplicate host bridge exits", () => duplicateBridge.exitCode !== null);
-  assert.equal(joins.filter((item) => item.nick === "room-left" && item.channel === "#pi-test").length, 1,
-    "concurrent sessions sharing a state path use one IRC bridge");
-  start(rightPath, "room-right");
+  start(leftPath, "left-session", "host-test");
+  await waitFor("first per-agent IRC client", () => joins.some((item) => item.nick === leftNick && item.channel === "#pi-test"));
+  const duplicateBridge = start(leftPath, "left-session", "host-test");
+  await waitFor("duplicate per-session bridge exits", () => duplicateBridge.exitCode !== null);
+  start(leftPath, "local-session-charlie", "host-test");
+  await waitFor("second same-host agent IRC client", () => joins.some((item) => item.nick === localNick && item.channel === "#pi-test"));
+  assert.equal(new Set([...clients].map((item) => item.nick)).size, clients.size,
+    "each local agent session gets its own IRC nick");
+  assert.ok([...clients].every((item) => item.nick.length <= 30), "generated session nicks fit IRC's length limit");
+  start(rightPath, "right-session", "other-host");
 
   await waitFor("both IRC clients and initial focus channel", () =>
-    joins.some((item) => item.nick === "room-left" && item.channel === "#pi-test") &&
-    joins.some((item) => item.nick === "room-left" && item.channel === "#pi-test-sync-v2") &&
-    joins.some((item) => item.nick === "room-right" && item.channel === "#pi-test") &&
-    joins.some((item) => item.nick === "room-right" && item.channel === "#pi-test-sync-v2") &&
+    joins.some((item) => item.nick === leftNick && item.channel === "#pi-test") &&
+    joins.some((item) => item.nick === leftNick && item.channel === "#pi-test-sync-v2") &&
+    joins.some((item) => item.nick === localNick && item.channel === "#pi-test") &&
+    joins.some((item) => item.nick === localNick && item.channel === "#pi-test-sync-v2") &&
+    joins.some((item) => item.nick === rightNick && item.channel === "#pi-test") &&
+    joins.some((item) => item.nick === rightNick && item.channel === "#pi-test-sync-v2") &&
     joins.some((item) => item.channel === "#pi-focus-builds") &&
+    joins.some((item) => item.channel === "#pi-focus-planning") &&
     joins.some((item) => item.channel === "#pi-focus-reviews"));
 
   const legacyUpdate = { v: 1, origin: "legacy-node", kind: "record", recordType: "update",
@@ -157,12 +168,14 @@ try {
   await waitFor("update propagation", async () => (await readState(rightPath)).updates.some((item) => item.text === "left update"));
   assert.ok(messages.some((item) => item.target === "#pi-test" && item.text.startsWith("[update]") &&
     item.text.includes("-left-left-left-s: left update")), "human updates identify host, agent, project and session");
+  assert.equal(messages.filter((item) => item.target === "#pi-test" && item.text.includes(": left update")).length, 1,
+    "only the originating agent publishes its update from shared state");
 
   left.messages.push({ id: "left-message", kind: "question", fromSessionId: "left-session", fromName: "left",
     toSessionId: "right-session", text: "direct question", createdAt: new Date().toISOString() });
   await writeState(leftPath, left);
   await waitFor("direct question propagation", async () => (await readState(rightPath)).messages.some((item) => item.text === "direct question"));
-  assert.ok(messages.some((item) => item.from === "room-left" && item.target === "room-right"), "targeted messages use the recipient IRC nick");
+  assert.ok(messages.some((item) => item.from === leftNick && item.target === rightNick), "targeted messages use the recipient IRC nick");
   assert.ok(messages.some((item) => item.target === "#pi-test" && item.text.startsWith("[focus]") &&
     item.text.includes("-left-left@main-left-s active:")),
     "focus announcements identify host, agent, project, branch and session");
@@ -180,13 +193,13 @@ try {
     ? { ...item, focus: "release automation", updatedAt: new Date().toISOString(), lastSeenAt: new Date().toISOString() }
     : item);
   await writeState(leftPath, left);
-  await waitFor("new focus channel join", () => joins.some((item) => item.nick === "room-left" && item.channel === "#pi-focus-release-automation"));
-  await waitFor("old focus channel leave", () => parts.some((item) => item.nick === "room-left" && item.channel === `#pi-focus-${oldFocus}`));
+  await waitFor("new focus channel join", () => joins.some((item) => item.nick === leftNick && item.channel === "#pi-focus-release-automation"));
+  await waitFor("old focus channel leave", () => parts.some((item) => item.nick === leftNick && item.channel === `#pi-focus-${oldFocus}`));
   assert.ok(messages.some((item) => item.target === "#pi-focus-release-automation"), "focus updates are publicized in the dynamic focus channel");
 
-  const joinedBeforeReconnect = joins.filter((item) => item.nick === "room-left" && item.channel === "#pi-test").length;
-  [...clients].find((client) => client.nick === "room-left").socket.destroy();
-  await waitFor("host bridge reconnect", () => joins.filter((item) => item.nick === "room-left" && item.channel === "#pi-test").length > joinedBeforeReconnect);
+  const joinedBeforeReconnect = joins.filter((item) => item.nick === leftNick && item.channel === "#pi-test").length;
+  [...clients].find((client) => client.nick === leftNick).socket.destroy();
+  await waitFor("per-agent bridge reconnect", () => joins.filter((item) => item.nick === leftNick && item.channel === "#pi-test").length > joinedBeforeReconnect);
   await new Promise((resolve) => setTimeout(resolve, 100));
   left = await readState(leftPath);
   left.messages.push({ id: "left-reconnect-message", kind: "question", fromSessionId: "left-session", fromName: "left",
@@ -194,8 +207,8 @@ try {
   await writeState(leftPath, left);
   await waitFor("targeted routing survives reconnect", async () =>
     (await readState(rightPath)).messages.some((item) => item.id === "left-reconnect-message"));
-  assert.ok(messages.some((item) => item.from === "room-left" && item.target === "room-right"),
-    "reconnected host routes messages to remote session nicks rather than rebroadcasting them");
+  assert.ok(messages.some((item) => item.from === leftNick && item.target === rightNick),
+    "reconnected agent routes messages to remote session nicks rather than rebroadcasting them");
 
   console.log("IRC backend multi-client integration: PASS");
 } finally {
