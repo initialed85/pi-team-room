@@ -35,7 +35,7 @@ function splitLine(line) {
 
 function session(id, name, focus) {
   const timestamp = new Date().toISOString();
-  return { id, name, cwd: `/tmp/${name}`, project: `/tmp/${name}`, branch: "main", focus,
+  return { id, name, agentType: "claude-code", sessionName: name, cwd: `/tmp/${name}`, project: `/tmp/${name}`, branch: "main", focus,
     status: "idle", connected: true, startedAt: timestamp, updatedAt: timestamp,
     lastSeenAt: timestamp, recentPaths: [] };
 }
@@ -127,11 +127,11 @@ function start(statePath, sessionId, hostName) {
 
 try {
   let left = state("left-session", "left", "builds");
-  left.sessions.push(session("local-session-charlie", "local", "planning"));
+  left.sessions.push({ ...session("local-session-charlie", "local", "planning"), agentType: "codex" });
   const right = state("right-session", "right", "reviews");
-  const leftNick = "host-te-left-left-ession";
-  const localNick = "host-te-local-local-harlie";
-  const rightNick = "other-h-right-right-ession";
+  const leftNick = "host-t-claude-left-ession";
+  const localNick = "host-t-codex-local-harlie";
+  const rightNick = "other-claude-right-ession";
   await writeState(leftPath, left);
   await writeState(rightPath, right);
   start(leftPath, "left-session", "host-test");
@@ -163,11 +163,11 @@ try {
   assert.equal((await readState(leftPath)).updates.some((item) => item.id === "legacy-main-update"), false,
     "protocol history in the human-facing room is ignored");
   left = await readState(leftPath);
-  left.updates.push({ id: "left-update", sessionId: "left-session", sessionName: "left", project: "/tmp/left", text: "left update", createdAt: new Date().toISOString() });
+  left.updates.push({ id: "left-update", sessionId: "left-session", agentType: "claude-code", sessionName: "left", project: "/tmp/left", text: "left update", createdAt: new Date().toISOString() });
   await writeState(leftPath, left);
   await waitFor("update propagation", async () => (await readState(rightPath)).updates.some((item) => item.text === "left update"));
   assert.ok(messages.some((item) => item.target === "#pi-test" && item.text.startsWith("[update]") &&
-    item.text.includes("-left-left-left-s: left update")), "human updates identify host, agent, project and session");
+    item.text.includes("-claude-code-left-left-s: left update")), "human updates identify host, agent, project and session");
   assert.equal(messages.filter((item) => item.target === "#pi-test" && item.text.includes(": left update")).length, 1,
     "only the originating agent publishes its update from shared state");
 
@@ -177,7 +177,7 @@ try {
   await waitFor("direct question propagation", async () => (await readState(rightPath)).messages.some((item) => item.text === "direct question"));
   assert.ok(messages.some((item) => item.from === leftNick && item.target === rightNick), "targeted messages use the recipient IRC nick");
   assert.ok(messages.some((item) => item.target === "#pi-test" && item.text.startsWith("[focus]") &&
-    item.text.includes("-left-left@main-left-s active:")),
+    item.text.includes("-claude-code-left-left-s active:")),
     "focus announcements identify host, agent, project, branch and session");
   assert.equal(messages.some((item) => item.target === "#pi-test" && item.text.startsWith("PI_TEAM_ROOM/1")), false,
     "machine protocol payloads stay off the human-facing room");
@@ -195,7 +195,7 @@ try {
   await writeState(leftPath, left);
   await waitFor("new focus channel join", () => joins.some((item) => item.nick === leftNick && item.channel === "#pi-focus-release-automation"));
   await waitFor("old focus channel leave", () => parts.some((item) => item.nick === leftNick && item.channel === `#pi-focus-${oldFocus}`));
-  assert.ok(messages.some((item) => item.target === "#pi-focus-release-automation"), "focus updates are publicized in the dynamic focus channel");
+  await waitFor("focus announcement in dynamic channel", () => messages.some((item) => item.target === "#pi-focus-release-automation"));
 
   const joinedBeforeReconnect = joins.filter((item) => item.nick === leftNick && item.channel === "#pi-test").length;
   [...clients].find((client) => client.nick === leftNick).socket.destroy();

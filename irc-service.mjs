@@ -267,13 +267,12 @@ function endpointNickFromNode(node, session) {
   const suffix = LOCAL_SESSION_ID.replace(/[^A-Za-z0-9]/g, "").slice(-6) || "agent";
   const configuredNick = process.env.PI_TEAM_ROOM_IRC_NICK;
   if (configuredNick) return sanitizeNick(`${sanitizeUser(configuredNick).slice(0, 23)}-${suffix}`);
-  const nickPart = (value) => displayPart(value).replace(/\./g, "-").slice(0, 7).replace(/[-_]+$/g, "") || "agent";
-  const host = nickPart(node.name);
-  const agent = nickPart(process.env.PI_TEAM_ROOM_AGENT_NAME || session?.name || "agent");
+  const nickPart = (value, max) => displayPart(value).replace(/\./g, "-").slice(0, max).replace(/[-_]+$/g, "") || "agent";
   const branch = String(session?.branch || "").split("/").at(-1);
   const project = basename(String(session?.project || "work"));
-  const task = nickPart(branch && !["main", "master", "develop"].includes(branch.toLowerCase()) ? branch : project);
-  return sanitizeNick(`${host}-${agent}-${task}-${suffix}`);
+  const sessionName = String(session?.sessionName || (branch && !["main", "master", "develop"].includes(branch.toLowerCase()) ? branch : project));
+  const agentType = String(session?.agentType || session?.name || "agent");
+  return sanitizeNick(`${nickPart(node.name, 6)}-${nickPart(agentType, 6)}-${nickPart(sessionName, 9)}-${suffix}`);
 }
 
 const nodePath = join(dirname(STATE_PATH), `.${basename(STATE_PATH)}.irc-node.json`);
@@ -421,14 +420,15 @@ function displayPart(value) {
 }
 
 function sessionLabel(record) {
-  const project = displayPart(basename(String(record.project || record.cwd || "project")));
-  const branch = record.branch ? `@${displayPart(String(record.branch).split("/").at(-1))}` : "";
-  return `${displayPart(node.name)}-${displayPart(record.name)}-${project}${branch}-${record.id.slice(0, 6)}`;
+  const agentType = displayPart(record.agentType || record.name);
+  const sessionName = displayPart(record.sessionName || basename(String(record.project || record.cwd || "project")));
+  return `${displayPart(node.name)}-${agentType}-${sessionName}-${record.id.slice(0, 6)}`;
 }
 
 function updateLabel(record) {
-  const project = displayPart(basename(String(record.project || "project")));
-  return `${displayPart(node.name)}-${displayPart(record.sessionName)}-${project}-${String(record.sessionId || "session").slice(0, 6)}`;
+  const agentType = displayPart(record.agentType || record.sessionName);
+  const sessionName = displayPart(record.sessionName || basename(String(record.project || "project")));
+  return `${displayPart(node.name)}-${agentType}-${sessionName}-${String(record.sessionId || "session").slice(0, 6)}`;
 }
 
 async function updateLocalNickname(session) {

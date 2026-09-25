@@ -143,7 +143,7 @@ export PI_TEAM_ROOM_IRC_SERVER_PASSWORD='only-if-the-server-requires-one'
 pi
 ```
 
-IRC mode joins the human-facing room channel and creates/joins dynamic public focus channels such as `#pi-focus-builds` when active sessions advertise a focus. Each agent session has its own IRC connection and nickname, derived from `<host>-<agent>-<project-or-branch>-<session-id>` and shortened to fit IRC's nick limit. Focus changes and updates appear as readable messages under that nick; their labels include the fuller `<host>-<agent>-<project>@<branch>-<session-id>` identity. Machine protocol traffic uses a separate sync channel (`PI_TEAM_ROOM_IRC_SYNC_CHANNEL`, defaulting to the room name plus `-sync-v2`), so the web client does not fill with encoded state payloads. Protocol-shaped messages in the human room and focus channels are ignored. Direct questions and replies are sent to the recipient's IRC nickname when known, with the protocol carrying the original session target. Use TLS and an access-controlled server; the IRC server can see team-room metadata and plaintext protocol messages.
+IRC mode joins the human-facing room channel and creates/joins dynamic public focus channels such as `#pi-focus-builds` when active sessions advertise a focus. Each agent session has its own IRC connection and nickname, derived from `<host>-<agent-type>-<session-name>-<session-id>` and shortened to fit IRC's nick limit. Focus changes and updates appear as readable messages under that nick; their labels include the fuller `<host>-<agent-type>-<session-name>-<session-id>` identity. Machine protocol traffic uses a separate sync channel (`PI_TEAM_ROOM_IRC_SYNC_CHANNEL`, defaulting to the room name plus `-sync-v2`), so the web client does not fill with encoded state payloads. Protocol-shaped messages in the human room and focus channels are ignored. Direct questions and replies are sent to the recipient's IRC nickname when known, with the protocol carrying the original session target. Use TLS and an access-controlled server; the IRC server can see team-room metadata and plaintext protocol messages.
 
 MCP and Pi clients start one IRC daemon per agent session, so each appears as a distinct IRC user and can receive targeted messages directly. Daemons share the same local `PI_TEAM_ROOM_STATE` file but publish only their own session's records; IRC snapshot exchange is coordinated per remote host to avoid multiplying full-state transfers. Configure the same state path and `PI_TEAM_ROOM_NODE_NAME` for all clients on a host. Each session daemon publishes that session's departure and exits after the per-session grace period. Ordinary chat typed in the human-facing IRC channel is not currently delivered to agents; use the `team_room` tool for agent questions and replies. The IRC server password is never written into team-room state or sent to the MCP tool.
 
@@ -194,7 +194,8 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 | `PI_TEAM_ROOM_MDNS` | `1` | Enable mDNS publish/discovery (`0` disables) |
 | `PI_TEAM_ROOM_MDNS_INTERFACE` | auto | Optional local IPv4 interface for mDNS |
 | `PI_TEAM_ROOM_NODE_NAME` | hostname | Friendly host label in session identities and generated IRC nicknames |
-| `PI_TEAM_ROOM_AGENT_NAME` | MCP client name | Friendly agent label in generated IRC nicknames |
+| `PI_TEAM_ROOM_AGENT_NAME` | MCP client name or `pi` | Agent type used in generated IRC nicknames and session labels |
+| `PI_TEAM_ROOM_SESSION_NAME` | Project or non-default Git branch | Optional friendly name for this session; Pi uses its session title by default |
 | `PI_TEAM_ROOM_SESSION_ID` | client-provided | Unique session identifier; normally set automatically, do not reuse across sessions |
 | `PI_TEAM_ROOM_IRC_HOST` | unset | IRC server hostname; required for `PI_TEAM_ROOM_NETWORK=irc` |
 | `PI_TEAM_ROOM_IRC_PORT` | `6667`/`6697` | IRC server port; TLS defaults to 6697 |
@@ -203,7 +204,7 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 | `PI_TEAM_ROOM_IRC_SYNC_CHANNEL` | `<room>-sync-v2` | IRC channel for encoded bridge protocol traffic |
 | `PI_TEAM_ROOM_IRC_FOCUS_PREFIX` | `#pi-focus-` | Prefix for dynamic public focus channels |
 | `PI_TEAM_ROOM_IRC_SERVER_PASSWORD` | unset | Optional IRC server password; never committed or stored in state |
-| `PI_TEAM_ROOM_IRC_NICK` | host/agent/task-derived | Optional nick prefix; a short session suffix is appended |
+| `PI_TEAM_ROOM_IRC_NICK` | host/agent-type/session-name-derived | Optional nick prefix; a short session suffix is appended |
 | `PI_TEAM_ROOM_IRC_USER` | node name | IRC username/identity field |
 | `PI_TEAM_ROOM_IRC_TLS_REJECT_UNAUTHORIZED` | `1` | Reject invalid TLS certificates unless explicitly disabled |
 | `PI_TEAM_ROOM_IRC_RECONNECT_MS` | `1000` | Delay before reconnecting after an IRC disconnect |

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -97,6 +97,12 @@ async function gitValue(cwd, ...args) {
 function projectLabel(project) {
   const home = process.env.HOME;
   return home && (project === home || project.startsWith(`${home}/`)) ? `~${project.slice(home.length)}` : project;
+}
+
+function defaultSessionName(project, branch) {
+  const branchName = branch?.split("/").at(-1);
+  if (branchName && !["main", "master", "develop"].includes(branchName.toLowerCase())) return branchName;
+  return basename(project) || project;
 }
 
 function activeSessions(state, current) {
@@ -201,7 +207,6 @@ const server = new McpServer({ name: "pi-team-room", version: "0.1.0" }, {
 let current;
 let heartbeat;
 let stopping;
-let clientName;
 let networkService;
 
 async function initializeSession() {
@@ -210,11 +215,14 @@ async function initializeSession() {
   const branch = await gitValue(cwd, "branch", "--show-current");
   const clientInfo = server.server.getClientVersion();
   const suggestedName = process.env.PI_TEAM_ROOM_AGENT_NAME || clientInfo?.name || `mcp-${hostname()}`;
-  clientName = truncate(suggestedName, 80);
+  const agentType = truncate(suggestedName, 80);
+  const sessionName = truncate(process.env.PI_TEAM_ROOM_SESSION_NAME || defaultSessionName(project, branch), 80);
   const timestamp = now();
   current = {
     id: process.env.PI_TEAM_ROOM_SESSION_ID || randomUUID(),
-    name: clientName,
+    name: agentType,
+    agentType,
+    sessionName,
     cwd,
     project,
     branch,
@@ -324,7 +332,7 @@ async function runAction(params) {
       return withState((state) => {
         const previous = state.updates.find((item) => item.sessionId === session.id && item.text === clean);
         if (previous && Date.now() - Date.parse(previous.createdAt) < 10 * 60 * 1_000) return "Already shared recently.";
-        state.updates.unshift({ id: randomUUID(), sessionId: session.id, sessionName: session.name, project: session.project, text: clean, createdAt: now() });
+        state.updates.unshift({ id: randomUUID(), sessionId: session.id, agentType: session.agentType, sessionName: session.sessionName || session.name, project: session.project, text: clean, createdAt: now() });
         state.updates = state.updates.slice(0, 100);
         return `Shared with the team: ${clean}`;
       });
@@ -394,7 +402,7 @@ async function runAction(params) {
       const clean = truncate(params.text, MAX_UPDATE_LENGTH);
       if (!clean) throw new Error("A fact or decision is required.");
       await withState((state) => {
-        state.journal.unshift({ id: randomUUID(), sessionId: session.id, project: session.project, text: clean, createdAt: now(), sessionName: session.name });
+        state.journal.unshift({ id: randomUUID(), sessionId: session.id, agentType: session.agentType, project: session.project, text: clean, createdAt: now(), sessionName: session.sessionName || session.name });
         state.journal = state.journal.slice(0, 500);
       });
       return `Saved to shared history: ${clean}`;

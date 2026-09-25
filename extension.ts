@@ -77,6 +77,8 @@ type StoredMessageDelivery = Exclude<MessageDelivery, "auto">;
 type WorkSession = {
   id: string;
   name: string;
+  agentType?: string;
+  sessionName?: string;
   cwd: string;
   project: string;
   branch?: string;
@@ -126,6 +128,7 @@ type TeamMessage = {
 type TeamUpdate = {
   id: string;
   sessionId: string;
+  agentType?: string;
   sessionName: string;
   project: string;
   text: string;
@@ -135,6 +138,7 @@ type TeamUpdate = {
 type JournalItem = {
   id: string;
   sessionId?: string;
+  agentType?: string;
   project: string;
   text: string;
   createdAt: string;
@@ -571,10 +575,17 @@ export default function (pi: ExtensionAPI) {
     const existing = current?.id === id ? current : persisted;
     const inferredFocus = recentUserPrompt(ctx);
     const focus = existing?.focusPinned ? existing.focus : (status === "working" ? inferredFocus : existing?.focus || inferredFocus);
+    const branchName = projectInfo.branch?.split("/").at(-1);
+    const projectName = projectInfo.project.split(/[\\/]/).filter(Boolean).at(-1) || projectInfo.project;
+    const fallbackName = branchName && !["main", "master", "develop"].includes(branchName.toLowerCase()) ? branchName : projectName;
+    const currentSessionName = process.env.PI_TEAM_ROOM_SESSION_NAME ||
+      sessionName(ctx, existing?.sessionName || existing?.name || fallbackName);
     const timestamp = now();
     const next: WorkSession = {
       id,
-      name: sessionName(ctx, existing?.name || `pi-${id.slice(0, 8)}`),
+      name: currentSessionName,
+      agentType: process.env.PI_TEAM_ROOM_AGENT_NAME || existing?.agentType || "pi",
+      sessionName: currentSessionName,
       cwd: ctx.cwd,
       project: projectInfo.project,
       branch: projectInfo.branch,
@@ -1057,7 +1068,7 @@ export default function (pi: ExtensionAPI) {
     return updateState((state) => {
       const previous = state.updates.find((item) => item.sessionId === current!.id && item.text === clean);
       if (previous && Date.now() - Date.parse(previous.createdAt) < 10 * 60 * 1000) return "Already shared recently.";
-      state.updates.unshift({ id: randomUUID(), sessionId: current!.id, sessionName: current!.name, project: current!.project, text: clean, createdAt: now() });
+      state.updates.unshift({ id: randomUUID(), sessionId: current!.id, agentType: current!.agentType, sessionName: current!.sessionName || current!.name, project: current!.project, text: clean, createdAt: now() });
       state.updates = state.updates.slice(0, 100);
       return `Shared with the team: ${clean}`;
     });
@@ -1199,7 +1210,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_info_changed", async (_event, ctx) => {
     if (!current) return;
-    current = { ...current, name: sessionName(ctx, current.name), updatedAt: now(), lastSeenAt: now() };
+    const currentSessionName = process.env.PI_TEAM_ROOM_SESSION_NAME || sessionName(ctx, current.sessionName || current.name);
+    current = { ...current, name: currentSessionName, sessionName: currentSessionName, updatedAt: now(), lastSeenAt: now() };
     await updateState((state) => { state.sessions = state.sessions.map((item) => item.id === current!.id ? current! : item); });
   });
 
@@ -1309,7 +1321,7 @@ export default function (pi: ExtensionAPI) {
           const clean = truncate(params.text || "", MAX_UPDATE_LENGTH);
           if (!clean) return toolResult("remember", "A fact or decision is required.");
           await updateState((state) => {
-            state.journal.unshift({ id: randomUUID(), sessionId: session.id, project: session.project, text: clean, createdAt: now(), sessionName: session.name });
+            state.journal.unshift({ id: randomUUID(), sessionId: session.id, agentType: session.agentType, project: session.project, text: clean, createdAt: now(), sessionName: session.sessionName || session.name });
             state.journal = state.journal.slice(0, 500);
           });
           return toolResult("remember", `Saved to shared history: ${clean}`);
@@ -1380,7 +1392,7 @@ export default function (pi: ExtensionAPI) {
         } else if (subcommand === "remember") {
           const clean = truncate(text, MAX_UPDATE_LENGTH);
           if (!clean) throw new Error("Usage: /team remember <fact or decision>");
-          await updateState((state) => { state.journal.unshift({ id: randomUUID(), sessionId: session.id, project: session.project, text: clean, createdAt: now(), sessionName: session.name }); });
+          await updateState((state) => { state.journal.unshift({ id: randomUUID(), sessionId: session.id, agentType: session.agentType, project: session.project, text: clean, createdAt: now(), sessionName: session.sessionName || session.name }); });
           ctx.ui.notify(`Saved to shared history: ${clean}`, "info");
         } else if (subcommand === "history") {
           ctx.ui.notify(renderHistory(searchJournal(await loadState(), session, text)), "info");
