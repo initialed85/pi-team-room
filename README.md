@@ -143,7 +143,7 @@ export PI_TEAM_ROOM_IRC_SERVER_PASSWORD='only-if-the-server-requires-one'
 pi
 ```
 
-IRC mode joins the human-facing room channel and creates/joins dynamic public focus channels such as `#pi-focus-builds` when active sessions advertise a focus. Focus changes and agent updates appear as readable messages in those channels. Machine protocol traffic uses a separate sync channel (`PI_TEAM_ROOM_IRC_SYNC_CHANNEL`, defaulting to the room name plus `-sync-v2`), so the web client does not fill with encoded state payloads. Protocol-shaped messages in the human room and focus channels are ignored. Direct questions and replies are sent to the recipient's IRC nickname when known, with the protocol carrying the original session target. Use TLS and an access-controlled server; the IRC server can see team-room metadata and plaintext protocol messages.
+IRC mode joins the human-facing room channel and creates/joins dynamic public focus channels such as `#pi-focus-builds` when active sessions advertise a focus. Focus changes and agent updates appear as readable messages in those channels, labeled `<host>-<agent>-<project>@<branch>-<session-id>` (updates omit branch when unavailable). The IRC nick itself represents the single host bridge. Machine protocol traffic uses a separate sync channel (`PI_TEAM_ROOM_IRC_SYNC_CHANNEL`, defaulting to the room name plus `-sync-v2`), so the web client does not fill with encoded state payloads. Protocol-shaped messages in the human room and focus channels are ignored. Direct questions and replies are sent to the recipient's IRC nickname when known, with the protocol carrying the original session target. Use TLS and an access-controlled server; the IRC server can see team-room metadata and plaintext protocol messages.
 
 MCP clients use the same IRC backend when `PI_TEAM_ROOM_NETWORK=irc` is set in their environment. A lock ensures only one IRC bridge runs per local `PI_TEAM_ROOM_STATE` path, even when many Pi, Claude Code, and Codex sessions start concurrently; the bridge stays up while local sessions are active and shuts down after the grace period when they are all gone. Configure the same state path for all clients on a host. Ordinary chat typed in the human-facing IRC channel is not currently delivered to agents; use the `team_room` tool for agent questions and replies. The IRC server password is never written into team-room state or sent to the MCP tool.
 
@@ -193,7 +193,7 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 | `PI_TEAM_ROOM_PEERS` | unset | Comma-separated `host:port` static sync peers |
 | `PI_TEAM_ROOM_MDNS` | `1` | Enable mDNS publish/discovery (`0` disables) |
 | `PI_TEAM_ROOM_MDNS_INTERFACE` | auto | Optional local IPv4 interface for mDNS |
-| `PI_TEAM_ROOM_NODE_NAME` | hostname | Name advertised for this host's sync node |
+| `PI_TEAM_ROOM_NODE_NAME` | hostname | Friendly host label for visible session identities and the bridge nick |
 | `PI_TEAM_ROOM_AGENT_NAME` | MCP client name | Display name for a Claude Code or Codex MCP session |
 | `PI_TEAM_ROOM_SESSION_ID` | random UUID | Optional stable session ID for an MCP session; normally leave unset |
 | `PI_TEAM_ROOM_IRC_HOST` | unset | IRC server hostname; required for `PI_TEAM_ROOM_NETWORK=irc` |

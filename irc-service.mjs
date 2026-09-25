@@ -266,10 +266,14 @@ let node;
 try {
   node = JSON.parse(await readFile(nodePath, "utf8"));
 } catch {
-  node = { id: randomUUID(), name: process.env.PI_TEAM_ROOM_NODE_NAME || hostname() };
-  await mkdir(dirname(nodePath), { recursive: true });
-  await writeFile(nodePath, `${JSON.stringify(node, null, 2)}\n`, { mode: 0o600 });
+  node = undefined;
 }
+if (!node || typeof node.id !== "string") node = { id: randomUUID(), name: hostname() };
+const configuredNodeName = process.env.PI_TEAM_ROOM_NODE_NAME?.trim();
+if (configuredNodeName) node.name = configuredNodeName;
+else if (typeof node.name !== "string" || !node.name.trim()) node.name = hostname();
+await mkdir(dirname(nodePath), { recursive: true });
+await writeFile(nodePath, `${JSON.stringify(node, null, 2)}\n`, { mode: 0o600 });
 
 let nick = endpointNickFromNode(node);
 let socket;
@@ -361,13 +365,28 @@ function localSessionEvent(record) {
   return { kind: "record", recordType: "session", record, nodeId: node.id, nick };
 }
 
+function displayPart(value) {
+  return String(value || "unknown").trim().replace(/\s+/g, "-").replace(/[^A-Za-z0-9_.-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "") || "unknown";
+}
+
+function sessionLabel(record) {
+  const project = displayPart(basename(String(record.project || record.cwd || "project")));
+  const branch = record.branch ? `@${displayPart(String(record.branch).split("/").at(-1))}` : "";
+  return `${displayPart(node.name)}-${displayPart(record.name)}-${project}${branch}-${record.id.slice(0, 6)}`;
+}
+
+function updateLabel(record) {
+  const project = displayPart(basename(String(record.project || "project")));
+  return `${displayPart(node.name)}-${displayPart(record.sessionName)}-${project}-${String(record.sessionId || "session").slice(0, 6)}`;
+}
+
 function publishReadableSession(record) {
   const focus = String(record.focus || record.checkpoint?.text || "").trim().replace(/\s+/g, " ");
   const state = record.connected === false ? "left" : "active";
-  const signature = JSON.stringify([record.name, focus, state]);
+  const signature = JSON.stringify([record.name, record.project, record.branch, focus, state]);
   if (readableSessionSignatures.get(record.id) === signature) return;
   readableSessionSignatures.set(record.id, signature);
-  const summary = `${record.name} [${record.id.slice(0, 8)}] ${state}: ${focus || "no focus recorded"}`;
+  const summary = `${sessionLabel(record)} ${state}: ${focus || "no focus recorded"}`;
   sendPublicText(IRC_CHANNEL, `[focus] ${summary}`);
   const channel = focusChannel(record.focus);
   if (channel) sendPublicText(channel, summary);
@@ -385,7 +404,7 @@ function sendRecord(recordType, record) {
   sendProtocol(IRC_SYNC_CHANNEL, event);
   if (recordType === "session") publishReadableSession(record);
   if (recordType === "update" && !String(record.sessionId || "").startsWith("irc:")) {
-    sendPublicText(IRC_CHANNEL, `[update] ${record.sessionName}: ${record.text}`);
+    sendPublicText(IRC_CHANNEL, `[update] ${updateLabel(record)}: ${record.text}`);
   }
 }
 

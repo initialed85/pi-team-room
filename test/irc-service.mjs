@@ -155,14 +155,17 @@ try {
   left.updates.push({ id: "left-update", sessionId: "left-session", sessionName: "left", project: "/tmp/left", text: "left update", createdAt: new Date().toISOString() });
   await writeState(leftPath, left);
   await waitFor("update propagation", async () => (await readState(rightPath)).updates.some((item) => item.text === "left update"));
+  assert.ok(messages.some((item) => item.target === "#pi-test" && item.text.startsWith("[update]") &&
+    item.text.includes("-left-left-left-s: left update")), "human updates identify host, agent, project and session");
 
   left.messages.push({ id: "left-message", kind: "question", fromSessionId: "left-session", fromName: "left",
     toSessionId: "right-session", text: "direct question", createdAt: new Date().toISOString() });
   await writeState(leftPath, left);
   await waitFor("direct question propagation", async () => (await readState(rightPath)).messages.some((item) => item.text === "direct question"));
   assert.ok(messages.some((item) => item.from === "room-left" && item.target === "room-right"), "targeted messages use the recipient IRC nick");
-  assert.ok(messages.some((item) => item.target === "#pi-test" && item.text.startsWith("[focus]")),
-    "human-facing room receives readable focus announcements");
+  assert.ok(messages.some((item) => item.target === "#pi-test" && item.text.startsWith("[focus]") &&
+    item.text.includes("-left-left@main-left-s active:")),
+    "focus announcements identify host, agent, project, branch and session");
   assert.equal(messages.some((item) => item.target === "#pi-test" && item.text.startsWith("PI_TEAM_ROOM/1")), false,
     "machine protocol payloads stay off the human-facing room");
 
