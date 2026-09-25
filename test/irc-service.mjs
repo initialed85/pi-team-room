@@ -119,18 +119,25 @@ function start(statePath, nick) {
 }
 
 try {
-  const left = state("left-session", "left", "builds");
-  const right = state("right-session", "right", "builds");
+  let left = state("left-session", "left", "builds");
+  const right = state("right-session", "right", "reviews");
   await writeState(leftPath, left);
   await writeState(rightPath, right);
   start(leftPath, "room-left");
+  await waitFor("first host bridge", () => joins.some((item) => item.nick === "room-left" && item.channel === "#pi-test"));
+  const duplicateBridge = start(leftPath, "room-left");
+  await waitFor("duplicate host bridge exits", () => duplicateBridge.exitCode !== null);
+  assert.equal(joins.filter((item) => item.nick === "room-left" && item.channel === "#pi-test").length, 1,
+    "concurrent sessions sharing a state path use one IRC bridge");
   start(rightPath, "room-right");
 
   await waitFor("both IRC clients and initial focus channel", () =>
     joins.some((item) => item.nick === "room-left" && item.channel === "#pi-test") &&
     joins.some((item) => item.nick === "room-right" && item.channel === "#pi-test") &&
-    joins.filter((item) => item.channel === "#pi-focus-builds").length >= 2);
+    joins.some((item) => item.channel === "#pi-focus-builds") &&
+    joins.some((item) => item.channel === "#pi-focus-reviews"));
 
+  left = await readState(leftPath);
   left.updates.push({ id: "left-update", sessionId: "left-session", sessionName: "left", project: "/tmp/left", text: "left update", createdAt: new Date().toISOString() });
   await writeState(leftPath, left);
   await waitFor("update propagation", async () => (await readState(rightPath)).updates.some((item) => item.text === "left update"));
@@ -146,12 +153,28 @@ try {
   await writeState(rightPath, right);
   await waitFor("direct reply propagation", async () => (await readState(leftPath)).messages.some((item) => item.text === "direct reply"));
 
-  const oldFocus = left.sessions[0].focus;
-  left.sessions[0] = { ...left.sessions[0], focus: "release automation", updatedAt: new Date().toISOString(), lastSeenAt: new Date().toISOString() };
+  const oldFocus = left.sessions.find((item) => item.id === "left-session").focus;
+  const localSession = left.sessions.find((item) => item.id === "left-session");
+  left.sessions = left.sessions.map((item) => item.id === localSession.id
+    ? { ...item, focus: "release automation", updatedAt: new Date().toISOString(), lastSeenAt: new Date().toISOString() }
+    : item);
   await writeState(leftPath, left);
   await waitFor("new focus channel join", () => joins.some((item) => item.nick === "room-left" && item.channel === "#pi-focus-release-automation"));
   await waitFor("old focus channel leave", () => parts.some((item) => item.nick === "room-left" && item.channel === `#pi-focus-${oldFocus}`));
   assert.ok(messages.some((item) => item.target === "#pi-focus-release-automation"), "focus updates are publicized in the dynamic focus channel");
+
+  const joinedBeforeReconnect = joins.filter((item) => item.nick === "room-left" && item.channel === "#pi-test").length;
+  [...clients].find((client) => client.nick === "room-left").socket.destroy();
+  await waitFor("host bridge reconnect", () => joins.filter((item) => item.nick === "room-left" && item.channel === "#pi-test").length > joinedBeforeReconnect);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  left = await readState(leftPath);
+  left.messages.push({ id: "left-reconnect-message", kind: "question", fromSessionId: "left-session", fromName: "left",
+    toSessionId: "right-session", text: "direct question after reconnect", createdAt: new Date().toISOString() });
+  await writeState(leftPath, left);
+  await waitFor("targeted routing survives reconnect", async () =>
+    (await readState(rightPath)).messages.some((item) => item.id === "left-reconnect-message"));
+  assert.ok(messages.some((item) => item.from === "room-left" && item.target === "room-right"),
+    "reconnected host routes messages to remote session nicks rather than rebroadcasting them");
 
   console.log("IRC backend multi-client integration: PASS");
 } finally {

@@ -243,7 +243,7 @@ function startNetworkService() {
     "PI_TEAM_ROOM_ADVERTISE_HOST", "PI_TEAM_ROOM_IRC_HOST", "PI_TEAM_ROOM_IRC_PORT", "PI_TEAM_ROOM_IRC_TLS",
     "PI_TEAM_ROOM_IRC_CHANNEL", "PI_TEAM_ROOM_IRC_FOCUS_PREFIX", "PI_TEAM_ROOM_IRC_SERVER_PASSWORD",
     "PI_TEAM_ROOM_IRC_TLS_REJECT_UNAUTHORIZED", "PI_TEAM_ROOM_IRC_RECONNECT_MS", "PI_TEAM_ROOM_IRC_POLL_MS",
-    "PI_TEAM_ROOM_IRC_NICK", "PI_TEAM_ROOM_IRC_USER",
+    "PI_TEAM_ROOM_IRC_NODE_GRACE_MS", "PI_TEAM_ROOM_IRC_NICK", "PI_TEAM_ROOM_IRC_USER",
   ];
   const env = { HOME: process.env.HOME, PATH: process.env.PATH };
   for (const key of forwardedKeys) if (process.env[key] !== undefined) env[key] = process.env[key];
@@ -429,7 +429,7 @@ async function shutdown() {
     await withState((state) => { state.sessions = state.sessions.map((item) => item.id === current.id ? current : item); }).catch(() => undefined);
   }
   const child = await networkService;
-  if (child && child.exitCode === null) child.kill("SIGTERM");
+  if (child && child.exitCode === null && process.env.PI_TEAM_ROOM_NETWORK !== "irc") child.kill("SIGTERM");
 }
 
 server.server.oninitialized = () => {

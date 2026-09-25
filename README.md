@@ -145,7 +145,7 @@ pi
 
 IRC mode joins the public room channel and creates/joins dynamic public focus channels such as `#pi-focus-builds` when active sessions advertise a focus. Direct questions and replies are sent to the recipient's IRC nickname when known, with the protocol carrying the original session target. State messages are deduplicated by record id and synchronized through the room. Use TLS and an access-controlled server; the IRC server can see team-room metadata and plaintext protocol messages.
 
-MCP clients use the same IRC backend when `PI_TEAM_ROOM_NETWORK=irc` is set in their environment. The IRC server password is never written into team-room state or sent to the MCP tool.
+MCP clients use the same IRC backend when `PI_TEAM_ROOM_NETWORK=irc` is set in their environment. A lock ensures only one IRC bridge runs per local `PI_TEAM_ROOM_STATE` path, even when many Pi, Claude Code, and Codex sessions start concurrently; the bridge stays up while local sessions are active and shuts down after the grace period when they are all gone. Configure the same state path for all clients on a host. The IRC server password is never written into team-room state or sent to the MCP tool.
 
 It is deliberately opt-in:
 
@@ -207,6 +207,7 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 | `PI_TEAM_ROOM_IRC_TLS_REJECT_UNAUTHORIZED` | `1` | Reject invalid TLS certificates unless explicitly disabled |
 | `PI_TEAM_ROOM_IRC_RECONNECT_MS` | `1000` | Delay before reconnecting after an IRC disconnect |
 | `PI_TEAM_ROOM_IRC_POLL_MS` | `250` | Local state polling interval for the IRC bridge |
+| `PI_TEAM_ROOM_IRC_NODE_GRACE_MS` | `120000` | Keep the host's shared IRC bridge alive this long after its last active session |
 | `PI_TEAM_ROOM_NODE_GRACE_MS` | `120000` | How long an idle sync node remains alive before exiting |
 | `PI_TEAM_ROOM_SYNC_MS` | `5000` | Network state reconciliation period |
 

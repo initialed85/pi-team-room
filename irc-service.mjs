@@ -2,6 +2,7 @@ import { createConnection, isIP } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
+import { readFileSync, unlinkSync } from "node:fs";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
@@ -17,6 +18,9 @@ const IRC_FOCUS_PREFIX = normalizeChannelPrefix(process.env.PI_TEAM_ROOM_IRC_FOC
 const IRC_SERVER_PASSWORD = process.env.PI_TEAM_ROOM_IRC_SERVER_PASSWORD || "";
 const IRC_TLS_REJECT_UNAUTHORIZED = process.env.PI_TEAM_ROOM_IRC_TLS_REJECT_UNAUTHORIZED !== "0";
 const IRC_RECONNECT_MS = Number(process.env.PI_TEAM_ROOM_IRC_RECONNECT_MS) || 1_000;
+const IRC_NODE_GRACE_MS = Number(process.env.PI_TEAM_ROOM_IRC_NODE_GRACE_MS) || 120_000;
+const INSTANCE_LOCK_PATH = `${STATE_PATH}.irc-service.lock`;
+const INSTANCE_LOCK_TOKEN = `${process.pid}:${randomUUID()}`;
 const IRC_USER = sanitizeUser(process.env.PI_TEAM_ROOM_IRC_USER || process.env.PI_TEAM_ROOM_NODE_NAME || hostname());
 const MAX_SESSIONS = 100;
 const MAX_MESSAGES = 5_000;
@@ -31,6 +35,46 @@ if (!IRC_HOST) {
   console.error("pi-team-room IRC backend: set PI_TEAM_ROOM_IRC_HOST");
   process.exit(1);
 }
+
+async function acquireInstanceLock() {
+  await mkdir(dirname(STATE_PATH), { recursive: true });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await writeFile(INSTANCE_LOCK_PATH, `${INSTANCE_LOCK_TOKEN}\n`, { flag: "wx", mode: 0o600 });
+      return true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let pid;
+      try {
+        pid = Number((await readFile(INSTANCE_LOCK_PATH, "utf8")).split(":", 1)[0]);
+      } catch {
+        pid = undefined;
+      }
+      if (Number.isInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch (processError) {
+          if (processError?.code === "EPERM") return false;
+          if (processError?.code !== "ESRCH") throw processError;
+        }
+      }
+      await unlink(INSTANCE_LOCK_PATH).catch(() => undefined);
+    }
+  }
+  return false;
+}
+
+function releaseInstanceLock() {
+  try {
+    if (readFileSync(INSTANCE_LOCK_PATH, "utf8").trim() === INSTANCE_LOCK_TOKEN) unlinkSync(INSTANCE_LOCK_PATH);
+  } catch {
+    // The lock may already have been removed after an unclean shutdown.
+  }
+}
+
+if (!(await acquireInstanceLock())) process.exit(0);
+process.once("exit", releaseInstanceLock);
 
 function normalizeChannel(value) {
   const trimmed = String(value || "").trim();
@@ -234,6 +278,8 @@ let input = "";
 let reconnectTimer;
 let reconnectResolve;
 let pollTimer;
+let leaseTimer;
+let noSessionsSince;
 let pollInFlight = false;
 let published = new Map();
 let joinedChannels = new Set();
@@ -322,16 +368,32 @@ function sendRecord(recordType, record) {
   }
 }
 
-async function announceSessions(state) {
+async function claimUnownedActiveSessions() {
+  let state = await loadState();
+  const unowned = state.sessions.filter((session) => activeSession(session) && !session.ircNodeId);
+  if (unowned.length === 0) return state;
+  const unownedIds = new Set(unowned.map((session) => session.id));
+  await withState((current) => {
+    current.sessions = current.sessions.map((session) =>
+      unownedIds.has(session.id) && !session.ircNodeId ? { ...session, ircNodeId: node.id } : session);
+  });
+  state = await loadState();
+  return state;
+}
+
+async function announceSessions() {
+  const state = await claimUnownedActiveSessions();
   syncFocusChannels(state);
   for (const session of state.sessions.filter(activeSession)) {
+    if (session.ircNodeId !== node.id) continue;
     sendRecord("session", session);
     sessionRoutes.set(session.id, { nodeId: node.id, nick });
+    published.set(`session:${session.id}`, recordSignature(session));
   }
 }
 
 async function publishLocalChanges() {
-  const state = await loadState();
+  const state = await claimUnownedActiveSessions();
   syncFocusChannels(state);
   const groups = [
     ["session", state.sessions],
@@ -344,13 +406,17 @@ async function publishLocalChanges() {
       const key = `${recordType}:${record.id}`;
       const signature = recordSignature(record);
       if (published.get(key) === signature) continue;
+      if (recordType === "session" && record.ircNodeId !== node.id) {
+        published.set(key, signature);
+        continue;
+      }
       sendRecord(recordType, record);
       published.set(key, signature);
     }
   }
 }
 
-async function mergeRemoteState(remote) {
+async function mergeRemoteState(remote, sourceNick, origin) {
   const incoming = cleanState(remote);
   await withState((state) => {
     const merged = mergeStates(state, incoming);
@@ -360,22 +426,28 @@ async function mergeRemoteState(remote) {
     state.journal = merged.journal;
   });
   markPublished(incoming);
+  for (const session of incoming.sessions) {
+    if (session.ircNodeId === origin) sessionRoutes.set(session.id, { nodeId: origin, nick: sourceNick });
+  }
   syncFocusChannels(incoming);
 }
 
-async function applyRecord(recordType, record) {
+async function applyRecord(recordType, record, origin) {
   if (!record || typeof record.id !== "string") return;
+  const incoming = recordType === "session" && origin ? { ...record, ircNodeId: origin } : record;
   await withState((state) => {
     const groups = { session: "sessions", message: "messages", update: "updates", journal: "journal" };
     const field = groups[recordType];
     if (!field) return;
     const records = state[field];
-    const index = records.findIndex((item) => item.id === record.id);
-    if (index >= 0) records[index] = mergeRecord(records[index], record);
-    else records.push(record);
+    const index = records.findIndex((item) => item.id === incoming.id);
+    if (index >= 0) {
+      records[index] = mergeRecord(records[index], incoming);
+      if (recordType === "session" && origin) records[index].ircNodeId = origin;
+    } else records.push(incoming);
     state[field] = records.slice(-({ sessions: MAX_SESSIONS, messages: MAX_MESSAGES, updates: MAX_UPDATES, journal: MAX_JOURNAL }[field]));
   });
-  published.set(`${recordType}:${record.id}`, recordSignature(record));
+  published.set(`${recordType}:${incoming.id}`, recordSignature(incoming));
   syncFocusChannels(await loadState());
 }
 
@@ -405,16 +477,16 @@ async function receiveProtocol(target, sourceNick, value) {
     return;
   }
   if (value.kind === "snapshot") {
-    await mergeRemoteState(value.state);
+    await mergeRemoteState(value.state, sourceNick, value.origin);
     return;
   }
   if (value.kind === "record") {
-    if (value.recordType === "session" && value.record?.id && value.nick && value.nodeId) {
-      sessionRoutes.set(value.record.id, { nodeId: value.nodeId, nick: value.nick });
+    if (value.recordType === "session" && value.record?.id) {
+      sessionRoutes.set(value.record.id, { nodeId: value.origin, nick: sourceNick });
     }
     const state = await loadState();
     if (value.recordType === "message" && value.record?.toSessionId && !state.sessions.some((item) => item.id === value.record.toSessionId)) return;
-    await applyRecord(value.recordType, value.record);
+    await applyRecord(value.recordType, value.record, value.origin);
   }
 }
 
@@ -438,9 +510,10 @@ function handleLine(line) {
   if (parsed.command === "001") {
     ready = true;
     joinChannel(IRC_CHANNEL);
-    void loadState().then(announceSessions);
-    sendProtocol(IRC_CHANNEL, { kind: "hello", nodeId: node.id, nick });
-    sendProtocol(IRC_CHANNEL, { kind: "request" });
+    void announceSessions().then(() => {
+      sendProtocol(IRC_CHANNEL, { kind: "hello", nodeId: node.id, nick });
+      sendProtocol(IRC_CHANNEL, { kind: "request" });
+    }).catch(() => undefined);
     return;
   }
   if (parsed.command === "433") {
@@ -492,11 +565,23 @@ function connectOnce() {
   });
 }
 
+async function checkNodeLease() {
+  const state = await loadState();
+  if (state.sessions.some(activeSession)) {
+    noSessionsSince = undefined;
+    return;
+  }
+  noSessionsSince ||= Date.now();
+  if (Date.now() - noSessionsSince >= IRC_NODE_GRACE_MS) stop();
+}
+
 async function run() {
   const initialState = await loadState();
   markPublished(initialState);
   pollTimer = setInterval(() => { if (!pollInFlight) { pollInFlight = true; void publishLocalChanges().finally(() => { pollInFlight = false; }); } }, POLL_MS);
+  leaseTimer = setInterval(() => { void checkNodeLease().catch(() => undefined); }, 15_000);
   pollTimer.unref?.();
+  leaseTimer.unref?.();
   while (!stopping) {
     await connectOnce();
     if (!stopping) await new Promise((resolve) => {
@@ -514,6 +599,7 @@ function stop() {
   if (stopping) return;
   stopping = true;
   clearInterval(pollTimer);
+  clearInterval(leaseTimer);
   clearTimeout(reconnectTimer);
   reconnectTimer = undefined;
   reconnectResolve?.();
