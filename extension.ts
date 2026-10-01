@@ -164,6 +164,15 @@ function truncate(text: string, max: number): string {
   return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}…`;
 }
 
+// Peer messages are refused rather than truncated, so the sender knows to split them.
+function peerMessageText(text: string): string {
+  const normalized = text.trim().replace(/\s+/g, " ");
+  if (normalized.length > MAX_UPDATE_LENGTH) {
+    throw new Error(`Message is ${normalized.length} characters; the limit is ${MAX_UPDATE_LENGTH}. Shorten it or send it as several messages. Nothing was sent.`);
+  }
+  return normalized;
+}
+
 function projectLabel(project: string): string {
   const home = process.env.HOME;
   if (home && (project === home || project.startsWith(`${home}/`))) return `~${project.slice(home.length)}`;
@@ -1095,7 +1104,7 @@ export default function (pi: ExtensionAPI) {
   ): Promise<string> {
     if (!current) throw new Error("Team room session is not ready");
     const cleanAgent = agent.trim().toLowerCase();
-    const clean = truncate(text, MAX_UPDATE_LENGTH);
+    const clean = peerMessageText(text);
     const delivery = normalizeDelivery(requestedDelivery);
     if (!cleanAgent || !clean) throw new Error(kind === "delegation" ? "Delegation requires an agent and task" : "Ask requires an agent name and question");
     if (kind === "delegation" && (!delegation?.target || !delegation.scope)) {
@@ -1156,7 +1165,7 @@ export default function (pi: ExtensionAPI) {
   async function replyToMessage(messageId: string, text: string, requestedDelivery: MessageDelivery = "auto"): Promise<string> {
     if (!current) throw new Error("Team room session is not ready");
     const cleanId = messageId.trim().toLowerCase();
-    const clean = truncate(text, MAX_UPDATE_LENGTH);
+    const clean = peerMessageText(text);
     const delivery = normalizeDelivery(requestedDelivery);
     if (!cleanId || !clean) throw new Error("Reply requires a message id and text");
     return updateState((state) => {

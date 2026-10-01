@@ -208,6 +208,13 @@ try {
   assert.match(await call(alpha, { action: "reply", messageId, text: "the refresh-token test" }), /Reply sent/);
   assert.match(await call(bravo, { action: "inbox" }), /refresh-token test/);
 
+  const messagesBeforeOverLimit = JSON.parse(readFileSync(statePath, "utf8")).messages.length;
+  await assert.rejects(call(bravo, { action: "ask", agent: "alpha", text: "x".repeat(501) }), /501 characters; the limit is 500.*Nothing was sent/);
+  await assert.rejects(call(alpha, { action: "reply", messageId, text: "y".repeat(501) }), /501 characters; the limit is 500/);
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).messages.length, messagesBeforeOverLimit, "over-limit ask/reply is refused, not truncated and sent");
+  assert.match(await call(bravo, { action: "ask", agent: "alpha", text: "z".repeat(500) }), /Question sent/, "a message exactly at the limit is still sent");
+  await call(alpha, { action: "inbox" });
+
   const delegation = await call(alpha, {
     action: "delegate",
     agent: "bravo",

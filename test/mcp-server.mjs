@@ -76,6 +76,28 @@ try {
   assert.match(reply.content[0].text, /Reply sent to codex-test/);
   assert.match((await codex.callTool({ name: "team_room", arguments: { action: "inbox" } })).content[0].text, /Validated; looks good/);
 
+  const messagesBeforeOverLimit = (await state()).messages.length;
+  const longAsk = await codex.callTool({ name: "team_room", arguments: { action: "ask", agent: "claude-test", text: "x".repeat(501) } });
+  assert.equal(longAsk.isError, true, "over-limit ask surfaces as an MCP tool error");
+  assert.match(longAsk.content[0].text, /501 characters; the limit is 500.*Nothing was sent/);
+  const longReply = await claude.callTool({ name: "team_room", arguments: { action: "reply", messageId, text: "y".repeat(501) } });
+  assert.equal(longReply.isError, true, "over-limit reply surfaces as an MCP tool error");
+  assert.equal((await state()).messages.length, messagesBeforeOverLimit, "over-limit ask/reply is refused, not truncated and sent");
+
+  // The heartbeat refreshes liveness but must not overwrite status (e.g. flip a running call to idle).
+  const lockPath = `${statePath}.lock`;
+  await writeFile(lockPath, "test\n", { flag: "wx" });
+  const marked = await state();
+  const claudeBefore = marked.sessions.find((session) => session.name === "claude-test");
+  claudeBefore.status = "working";
+  await writeFile(statePath, `${JSON.stringify(marked, null, 2)}\n`, { mode: 0o600 });
+  await rm(lockPath);
+  const refreshed = await waitFor("a heartbeat after marking working", async () => {
+    const session = (await state()).sessions.find((item) => item.name === "claude-test");
+    return Date.parse(session.lastSeenAt) > Date.parse(claudeBefore.lastSeenAt) + 250 ? session : undefined;
+  });
+  assert.equal(refreshed.status, "working", "heartbeats refresh lastSeenAt without overwriting status");
+
   const delegation = await codex.callTool({
     name: "team_room",
     arguments: {

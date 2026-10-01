@@ -64,6 +64,8 @@ codex mcp add team-room --env PI_TEAM_ROOM_AGENT_NAME=codex -- node "$(pwd)/mcp-
 
 Run those commands from the checkout directory, or substitute its absolute path. Each MCP connection creates a live session in the same local state file as Pi, so all three clients can see one another and address a peer by its displayed name or short session ID. Set `PI_TEAM_ROOM_STATE` identically for clients that need a non-default state location. MCP sessions are polled rather than automatically woken: the agent sees direct questions when it next calls `team_room` (for example, `inbox` or `pulse`).
 
+An MCP session's `working`/`idle` status only reflects `team_room` tool-call activity, not the client's whole model turn, so an MCP peer can show `idle` while it's busy. Direct messages (`ask`, `delegate` task text, `reply`) are limited to 500 characters in both Pi and MCP; longer text is refused with an error rather than truncated, so split it across several messages.
+
 ### Code-owner delegation
 
 When the target repository or component has an online code-owner session, the preferred workflow is to delegate implementation to that peer rather than editing its checkout from another project. The delegating agent should state the target, concrete scope, acceptance checks, and expected artifact (for example, a commit, image tag, or release); the owner implements, tests, and commits/pushes, while the coordinator handles integration or rollout. If the owner is offline, state any fallback explicitly and only take over when the current user authorization covers it.

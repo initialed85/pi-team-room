@@ -30,6 +30,15 @@ function truncate(text, max) {
   return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}…`;
 }
 
+// Peer messages are refused rather than truncated, so the sender knows to split them.
+function peerMessageText(text) {
+  const normalized = String(text || "").trim().replace(/\s+/g, " ");
+  if (normalized.length > MAX_UPDATE_LENGTH) {
+    throw new Error(`Message is ${normalized.length} characters; the limit is ${MAX_UPDATE_LENGTH}. Shorten it or send it as several messages. Nothing was sent.`);
+  }
+  return normalized;
+}
+
 function shortId(id) {
   return id.slice(0, 8);
 }
@@ -208,6 +217,7 @@ let current;
 let heartbeat;
 let stopping;
 let networkService;
+let inFlightCalls = 0;
 
 async function initializeSession() {
   const cwd = process.cwd();
@@ -237,7 +247,7 @@ async function initializeSession() {
     state.sessions = [current, ...state.sessions.filter((session) => session.id !== current.id)].slice(0, MAX_SESSIONS);
   });
   startNetworkService();
-  heartbeat = setInterval(() => { void setStatus("idle").catch(() => undefined); }, HEARTBEAT_MS);
+  heartbeat = setInterval(() => { void touch().catch(() => undefined); }, HEARTBEAT_MS);
   heartbeat.unref?.();
 }
 
@@ -278,9 +288,20 @@ async function setStatus(status) {
   });
 }
 
+// Status only reflects team_room tool-call activity: an MCP server can't see the client's model turn.
+// The heartbeat refreshes liveness and leaves status alone, so it can't flip a running call to idle.
+async function touch() {
+  if (!current || stopping) return;
+  const timestamp = now();
+  current = { ...current, updatedAt: timestamp, lastSeenAt: timestamp };
+  await withState((state) => {
+    state.sessions = state.sessions.map((session) => session.id === current.id ? { ...session, updatedAt: timestamp, lastSeenAt: timestamp } : session);
+  });
+}
+
 async function sendPeerMessage(kind, agent, text, delegation, requestedDelivery = "auto") {
   const cleanAgent = (agent || "").trim().toLowerCase();
-  const clean = truncate(text, MAX_UPDATE_LENGTH);
+  const clean = peerMessageText(text);
   if (!cleanAgent || !clean) throw new Error(kind === "delegation" ? "Delegation requires an agent and task" : "Ask requires an agent name and question");
   if (kind === "delegation" && (!delegation?.target || !delegation.scope)) throw new Error("Delegation requires target and scope");
   return withState((state) => {
@@ -355,7 +376,7 @@ async function runAction(params) {
     }
     case "reply": {
       const messageId = (params.messageId || "").trim().toLowerCase();
-      const clean = truncate(params.text, MAX_UPDATE_LENGTH);
+      const clean = peerMessageText(params.text);
       if (!messageId || !clean) throw new Error("Reply requires a message id and text");
       return withState((state) => {
         const original = state.messages.find((item) => item.toSessionId === session.id &&
@@ -418,6 +439,7 @@ server.registerTool("team_room", {
   inputSchema: paramsSchema,
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
 }, async (params) => {
+  inFlightCalls++;
   try {
     await setStatus("working");
     const text = await runAction(params);
@@ -425,7 +447,8 @@ server.registerTool("team_room", {
   } catch (error) {
     return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true };
   } finally {
-    await setStatus("idle").catch(() => undefined);
+    inFlightCalls--;
+    if (inFlightCalls === 0) await setStatus("idle").catch(() => undefined);
   }
 });
 
