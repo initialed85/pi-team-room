@@ -11,6 +11,7 @@
 - Add a theme-aware highlighted separator to expanded team-room drawers so they remain distinct from teammate chat messages.
 - Experimental opt-in cross-host sync node with authenticated HTTP reconciliation, mDNS discovery, and static peer fallback for routed networks.
 - Network integration tests covering authentication, state merging, and private state-file permissions.
+- Automatic private SQLite projections of persisted Pi session JSONL, plus `pi-team-history` indexing, timestamp pruning, multi-session timeline materialization, and SQL querying.
 
 ## [0.1.0] — 2026-08-30
 

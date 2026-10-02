@@ -9,9 +9,13 @@
     "node": ">=22.6"
   },
   "scripts": {
-    "test": "npm run test:core && npm run test:network",
+    "test": "npm run test:core && npm run test:network && npm run test:history",
     "test:core": "node test/harness.mjs",
-    "test:network": "node test/network-service.mjs"
+    "test:network": "node test/network-service.mjs",
+    "test:history": "node test/session-history.mjs"
+  },
+  "bin": {
+    "pi-team-history": "./session-history.mjs"
   },
   "dependencies": {
     "bonjour-service": "^1.4.4"

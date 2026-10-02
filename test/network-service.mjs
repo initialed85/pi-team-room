@@ -172,6 +172,15 @@ try {
     child.once("exit", resolvePromise);
     setTimeout(resolvePromise, 1_000);
   })));
-  await rm(leftDir, { recursive: true, force: true });
-  await rm(rightDir, { recursive: true, force: true });
+  for (const directory of [leftDir, rightDir]) {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        await rm(directory, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        if (error?.code !== "ENOTEMPTY" || attempt === 5) throw error;
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+      }
+    }
+  }
 }

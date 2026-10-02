@@ -171,6 +171,16 @@ try {
     return result.content[0].text;
   }
 
+  async function waitFor(label, predicate, timeoutMs = 3_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const value = predicate();
+      if (value) return value;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+    }
+    throw new Error(`Timed out waiting for ${label}`);
+  }
+
   const alpha = makePeer("aaaaaaaa-1111-2222-3333-444444444444", "alpha", true, "/tmp/project-alpha");
   const bravo = makePeer("bbbbbbbb-1111-2222-3333-444444444444", "bravo", true, "/tmp/project-bravo");
   await alpha.handlers.session_start({}, alpha.ctx);
@@ -236,8 +246,7 @@ try {
   assert.equal(commandDelegation.kind, "delegation");
   assert.equal(commandDelegation.delegation.scope, "Only the CLI package.");
   assert.equal(commandDelegation.delegation.userAuthorization, "Commit and push the CLI fix.");
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
-  const delegationWake = bravo.sendCalls.find((entry) => entry.message?.content?.includes("Code-owner delegation"));
+  const delegationWake = await waitFor("delegation wake", () => bravo.sendCalls.find((entry) => entry.message?.content?.includes("Code-owner delegation")));
   assert.ok(delegationWake, "online code owner receives a delegation wake");
   assert.match(delegationWake.message.content, /User authorization: Commit and push this scoped change/);
   assert.match(delegationWake.message.content, /Acceptance checks: Run the focused auth tests/);
@@ -257,14 +266,17 @@ try {
   await charlie.handlers.session_start({}, charlie.ctx);
   const autoQuestion = await call(alpha, { action: "ask", agent: "charlie", text: "is the branch ready?" });
   assert.match(autoQuestion, /delivery: steer \(auto\)/);
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
-  const wake = charlie.sendCalls.find((entry) => entry.message?.content?.includes("is the branch ready"));
+  const wake = await waitFor("idle peer wake", () => charlie.sendCalls.find((entry) => entry.message?.content?.includes("is the branch ready")));
   assert.ok(wake, "idle peer receives an automatic wake");
   assert.equal(wake.message.customType, "pi-team-room-wake");
   assert.equal(wake.options.triggerTurn, true);
   assert.equal(wake.options.deliverAs, "steer");
   assert.match(wake.message.content, /trusted teammate coordination context/);
   assert.match(wake.message.content, /explicitly relayed user approvals/);
+  await waitFor("idle wake state update", () => {
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    return state.messages.find((message) => message.text === "is the branch ready?")?.deliveredAt;
+  });
   const stateAfterWake = JSON.parse(readFileSync(statePath, "utf8"));
   const wakeMessage = stateAfterWake.messages.find((message) => message.text === "is the branch ready?");
   assert.ok(wakeMessage?.deliveredAt, "wake marks the message delivered");
@@ -281,7 +293,10 @@ try {
   assert.equal(flaky.sendCalls.length, 0, "failed wake is not recorded as sent");
   assert.equal(failedWakeMessage.deliveredAt, undefined, "failed wake remains pending");
   flaky.sendMessageFailures = 0;
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
+  await waitFor("retried wake", () => {
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    return state.messages.find((message) => message.text === "retry this wake")?.deliveredAt;
+  });
   const retriedWakeState = JSON.parse(readFileSync(statePath, "utf8"));
   const retriedWakeMessage = retriedWakeState.messages.find((message) => message.text === "retry this wake");
   assert.equal(flaky.sendCalls.length, 1, "pending wake retries after a send failure");
@@ -292,8 +307,7 @@ try {
   await delta.handlers.before_agent_start({ systemPrompt: "BASE" }, delta.ctx);
   const steerQuestion = await call(alpha, { action: "ask", agent: "delta", text: "the API contract changed; adjust your next step", delivery: "steer" });
   assert.match(steerQuestion, /delivery: steer/);
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
-  const steer = delta.sendCalls.find((entry) => entry.message?.content?.includes("API contract changed"));
+  const steer = await waitFor("explicit steer", () => delta.sendCalls.find((entry) => entry.message?.content?.includes("API contract changed")));
   assert.ok(steer, "busy peer receives an explicitly requested steer");
   assert.equal(steer.options.deliverAs, "steer");
   assert.match(steer.message.content, /steering message/);
@@ -303,8 +317,7 @@ try {
   await foxtrot.handlers.before_agent_start({ systemPrompt: "BASE" }, foxtrot.ctx);
   const followUpQuestion = await call(alpha, { action: "ask", agent: "foxtrot", text: "when you finish, can you check the logs?" });
   assert.match(followUpQuestion, /delivery: followUp \(auto\)/);
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
-  const followUp = foxtrot.sendCalls.find((entry) => entry.message?.content?.includes("check the logs"));
+  const followUp = await waitFor("automatic follow-up", () => foxtrot.sendCalls.find((entry) => entry.message?.content?.includes("check the logs")));
   assert.ok(followUp, "busy peer receives an automatic follow-up");
   assert.equal(followUp.options.deliverAs, "followUp");
   assert.match(followUp.message.content, /queued as a follow-up/);
@@ -331,7 +344,10 @@ try {
   const echo = makePeer("eeeeeeee-1111-2222-3333-444444444444", "echo", true, "/tmp/project-echo");
   await echo.handlers.session_start({}, echo.ctx);
   await call(alpha, { action: "ask", agent: "echo", text: "🐈" });
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 140));
+  await waitFor("passive terminal signal delivery", () => {
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    return state.messages.find((message) => message.text === "🐈")?.deliveredAt;
+  });
   assert.equal(echo.sendCalls.length, 0, "terminal signal does not wake a peer");
   const stateAfterDone = JSON.parse(readFileSync(statePath, "utf8"));
   const doneMessage = stateAfterDone.messages.find((message) => message.text === "🐈");

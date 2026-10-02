@@ -2,7 +2,7 @@
 
 A small, local, informal shared context layer for Pi sessions. It is intended to make switching between parallel tasks feel like returning to a shared office: agents can see a compact team pulse, leave useful updates, ask peers questions, and preserve quiet task checkpoints.
 
-It deliberately has no hierarchy, assignments, ticket workflow, or automatic forwarding.
+It deliberately has no hierarchy, persistent assignment or ticket workflow, or automatic forwarding; scoped code-owner handoffs are an explicit coordination path.
 
 ## Install for Pi
 
@@ -108,6 +108,45 @@ When an agent has nothing substantive left to say, it may send a direct reply co
 
 While a session is open, a one-line **live widget** sits above the editor showing the active peer names and statuses, with unread counts when relevant. It uses the active Pi theme for status markers, names, updates, and unread indicators. In fullscreen TUI mode, expanding temporarily grows the widget; in regular scrollback mode, the compact widget stays fixed and expansion is shown as a non-capturing overlay with a theme-aware highlighted divider, so the drawer remains distinct from teammate chat and the transcript/editor do not jump when it is collapsed. It refreshes on the heartbeat and session events and never enters the LLM context. Press `Shift+Up` (or use `/team expand`) to temporarily show focus, checkpoints, and recent updates; press it again or use `/team compact` to collapse it. `/team` (or `/team summary`) also appends a durable themed card to the transcript.
 
+## Session history (SQLite)
+
+Pi already saves the complete persisted conversation for each normal session as a JSONL file under `~/.pi/agent/sessions/`. That includes user and assistant messages, thinking, tool-call arguments, tool results, Bash executions, compaction/branch metadata, model changes, and extension entries. Pi also has `/export` (HTML), `--mode json` (a live event stream), and `/share`; it does **not** provide a built-in queryable SQLite history or a multi-session timeline builder.
+
+Pi Team Room automatically maintains a private SQLite projection for every persisted session when the extension is loaded. Sidecars live under `~/.pi/agent/session-history/<session-id>.sqlite`, are mode `0600`, and retain the original JSON for every entry as well as query-friendly entry, content-block, and tool-call tables. This is an index of Pi's canonical JSONL, not a second competing transcript; use the utility below to backfill older sessions.
+
+The package includes `pi-team-history` (or run `node session-history.mjs` from this checkout):
+
+```bash
+# Discover saved sessions
+pi-team-history list
+
+# Backfill/refresh one session, or all sessions when --session is omitted
+pi-team-history index --session <path-or-session-id>
+pi-team-history index
+
+# Build one pruned, multi-session SQLite timeline. Repeat --session to merge.
+pi-team-history build \\
+  --session <session-a-path-or-id> --from 2026-09-03T10:00:00Z --to 2026-09-03T12:00:00Z \\
+  --session <session-b-path-or-id> --from 2026-09-03T10:30:00Z \\
+  --output ./related-work.sqlite
+
+# Query the resulting DB (JSON output, suitable for jq)
+pi-team-history query --db ./related-work.sqlite \\
+  --sql 'SELECT timestamp, session_name, role, text FROM timeline ORDER BY timestamp'
+
+# Especially useful normalized tool-call query
+pi-team-history query --db ./related-work.sqlite \\
+  --sql 'SELECT called_at, session_id, tool_name, arguments_json, result_text FROM tool_calls ORDER BY called_at'
+```
+
+`--from`/`--to` are inclusive and accept ISO timestamps or `YYYY-MM-DD`. Each repeated `--session` can have its own bounds. The merged DB keeps session provenance and does not physically need to reorder rows: query `timeline` with `ORDER BY timestamp, session_id, ordinal` to interleave adjacent sessions deterministically. `raw_json` preserves the literal source entry, while `content_blocks` and `tool_calls` make common filtering straightforward. Use any SQLite client for richer queries, joins, views, exports, or blog-generation scripts.
+
+Set `PI_SESSION_HISTORY=0` to disable automatic sidecar maintenance. `PI_SESSION_HISTORY_DIR` changes the sidecar directory; the CLI also accepts `--history-dir`. Ephemeral `--no-session` runs have no persisted source and are intentionally not indexed.
+
+### What is and is not captured
+
+The sidecar contains the complete persisted Pi session, including tool calls and results. It does not attempt to store every token-level streaming delta or provider HTTP payload; use `pi --mode json` when that lower-level event stream is what you need. Since Pi's JSONL retains branches and compaction metadata, the DB preserves those records rather than silently reducing a session to only the current LLM context.
+
 ## Auto checkpoints
 
 When a session shuts down, if it was meaningfully active but never saved an explicit `checkpoint`, the extension leaves an automatic breadcrumb derived from its focus/latest prompt and prefixed `[auto]`. This means even a forgotten session leaves a resume point for teammates — but only as a fallback: explicit checkpoints always win, and sessions that have not been active for at least `PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS` create nothing.
@@ -148,13 +187,16 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 - The extension reads and writes the state atomically enough for local peer processes using a lock file and rename-based writes.
 - Shared state is best-effort: if another Pi instance is unavailable, the local session keeps working.
 - All sessions on this machine share one room. Project/repository paths and branches are retained as labels so parallel work remains distinguishable without making any project invisible.
-- `npm test` runs core and network multi-peer integration harnesses using isolated extension instances and temporary state files.
+- `npm test` runs core, network, and session-history integration harnesses using isolated extension instances and temporary state files.
+- Session history is a private local projection of Pi JSONL. It is intentionally separate from team-room coordination state and is never network-synchronized by this extension.
 
 ## Knobs
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `PI_TEAM_ROOM_STATE` | `~/.pi/team-room/state.json` | Shared state file |
+| `PI_SESSION_HISTORY` | `1` | Maintain per-session SQLite history sidecars (`0` disables automatic indexing) |
+| `PI_SESSION_HISTORY_DIR` | `~/.pi/agent/session-history` | Per-session SQLite sidecar directory |
 | `PI_TEAM_ROOM_HEARTBEAT_MS` | `30000` | Presence ping + inbox poll period |
 | `PI_TEAM_ROOM_WAKE` | `1` | Allow automatic direct-message delivery and wake/queue behavior (`0` disables) |
 | `PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS` | `120000` | Minimum session activity before shutdown auto-checkpoint |

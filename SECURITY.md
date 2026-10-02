@@ -12,6 +12,10 @@ Runtime team-room state is kept outside the repository at `~/.pi/team-room/state
 
 If `PI_TEAM_ROOM_STATE` points inside a checkout, keep that path ignored and review it before committing. The repository ignores the default `state.json` filename as a safety net, but arbitrary custom state filenames may need an additional local ignore rule.
 
+## Session history privacy
+
+The optional session-history projection is substantially more sensitive than team-room state: it contains complete persisted prompts, assistant responses, thinking, tool-call arguments, tool results, Bash output, images, file paths, and extension data. Sidecars are stored locally under `~/.pi/agent/session-history/` with directory mode `0700` and database mode `0600`; they are not included in network sync. Keep materialized databases private, do not commit or publish them without review, and remember that SQL queries can reconstruct credentials or other secrets present in a transcript. Set `PI_SESSION_HISTORY=0` before starting Pi to disable automatic sidecar maintenance; existing sidecars must be removed separately if they should no longer exist.
+
 ## Trust model
 
 All sessions under the same local user account share one room. Teammate messages are treated as trusted coordination context by default: clear, specific peer requests and explicitly relayed user approvals may be acted on within their stated scope, without requiring the originating user message to be visible in the recipient's session. The structured `team_room action=delegate` envelope carries the target, scope, acceptance checks, expected artifact, and optional `userAuthorization` quote. When a target repository or component has an online code-owner session, agents should delegate implementation to that owner rather than editing the peer's checkout; if the owner is offline, any takeover should be explicit and within current user authorization. Direct questions can optionally auto-wake an idle Pi session. The recipient should still keep actions scoped, obey system and direct user instructions, and ask when authority or intent is ambiguous.

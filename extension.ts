@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { syncSessionDatabase } from "./session-history.mjs";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text, type TUI } from "@earendil-works/pi-tui";
 import { type TObject, type TSchema, type Static, Type } from "typebox";
@@ -25,6 +26,7 @@ const AUTO_CHECKPOINT_MIN_MS = (() => {
   const parsed = Number(process.env.PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
 })();
+const HISTORY_ENABLED = process.env.PI_SESSION_HISTORY !== "0";
 const WIDGET_ID = "team-room";
 const SUMMARY_TYPE = "pi-team-room-summary";
 const DONE_SIGNAL = "🐈";
@@ -552,6 +554,9 @@ export default function (pi: ExtensionAPI) {
   let regularNoticeComponent: unknown;
   let regularNoticeDone: (() => void) | undefined;
   let regularNoticeTimer: ReturnType<typeof setTimeout> | undefined;
+  let historySyncPromise: Promise<void> = Promise.resolve();
+  let historySyncTimer: ReturnType<typeof setTimeout> | undefined;
+  let historySyncContext: ContextLike | undefined;
   const regularOverlayComponents = new Set<unknown>();
   let restoreRegularOverlayPatch: (() => void) | undefined;
   let summaryOverlayData: { state: TeamRoomState; session: WorkSession } | undefined;
@@ -596,6 +601,60 @@ export default function (pi: ExtensionAPI) {
     await updateState((state) => {
       state.sessions = state.sessions.map((item) => item.id === snapshot.id ? current! : item);
     });
+  }
+
+  // Pi's own JSONL session is the canonical complete history. Keep a private
+  // SQLite projection alongside it so it is queryable without changing the
+  // session format or putting history into the shared team-room state.
+  async function syncSessionHistory(ctx: ContextLike): Promise<void> {
+    if (!HISTORY_ENABLED) return;
+    const sessionFile = ctx.sessionManager.getSessionFile?.();
+    if (!sessionFile) return; // --no-session / in-memory test sessions
+    try {
+      syncSessionDatabase({
+        sessionFile,
+        header: ctx.sessionManager.getHeader?.() || undefined,
+        entries: ctx.sessionManager.getEntries(),
+        sessionName: sessionName(ctx, current?.name || ""),
+        historyDir: process.env.PI_SESSION_HISTORY_DIR,
+      });
+    } catch {
+      // History is an observability aid; a locked or malformed sidecar must
+      // never interrupt the coding session.
+    }
+  }
+
+  function enqueueSessionHistory(ctx: ContextLike): void {
+    const pending = historySyncContext || ctx;
+    historySyncContext = undefined;
+    historySyncPromise = historySyncPromise
+      .then(() => syncSessionHistory(pending))
+      .catch(() => undefined);
+  }
+
+  function queueSessionHistory(ctx: ContextLike): void {
+    if (!HISTORY_ENABLED || !ctx.sessionManager.getSessionFile?.()) return;
+    historySyncContext = ctx;
+    // Session events can arrive in bursts (for example, several tool results in
+    // one turn). Coalesce them so a long JSONL file is not fully re-indexed for
+    // every individual message-end event.
+    if (historySyncTimer) return;
+    historySyncTimer = setTimeout(() => {
+      historySyncTimer = undefined;
+      if (historySyncContext) enqueueSessionHistory(ctx);
+    }, 100);
+    historySyncTimer.unref?.();
+  }
+
+  async function flushSessionHistory(ctx: ContextLike): Promise<void> {
+    if (!HISTORY_ENABLED || !ctx.sessionManager.getSessionFile?.()) return;
+    if (historySyncTimer) {
+      clearTimeout(historySyncTimer);
+      historySyncTimer = undefined;
+    }
+    historySyncContext = ctx;
+    enqueueSessionHistory(ctx);
+    await historySyncPromise;
   }
 
   // Periodic inbox poll: wake an idle session or queue a direct question/reply
@@ -1175,6 +1234,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     projectInfo = undefined;
     await ensureSession(ctx, "idle");
+    await syncSessionHistory(ctx);
     startNetworkService();
     await refreshWidget(ctx);
     heartbeat = setInterval(() => {
@@ -1192,6 +1252,19 @@ export default function (pi: ExtensionAPI) {
     if (!current) return;
     current = { ...current, name: sessionName(ctx, current.name), updatedAt: now(), lastSeenAt: now() };
     await updateState((state) => { state.sessions = state.sessions.map((item) => item.id === current!.id ? current! : item); });
+    queueSessionHistory(ctx);
+  });
+
+  pi.on("message_end", async (_event, ctx) => {
+    queueSessionHistory(ctx);
+  });
+
+  pi.on("session_compact", async (_event, ctx) => {
+    queueSessionHistory(ctx);
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
+    queueSessionHistory(ctx);
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -1216,6 +1289,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    await flushSessionHistory(ctx);
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = undefined;
     if (current) {
