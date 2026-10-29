@@ -153,6 +153,29 @@ try {
     return state.messages.some((item) => item.kind === "delegation" && item.delegation?.userAuthorization === "Commit the scoped service fix.");
   });
 
+  // Long briefs are bounded on the wire too: a snapshot whose message text blows
+  // past the shared budget keeps the newest messages and drops the oldest.
+  const flood = Array.from({ length: 60 }, (_unused, index) => ({
+    id: `flood-${String(index).padStart(3, "0")}`,
+    kind: "reply",
+    fromSessionId: "flood-session",
+    fromName: "flood",
+    toSessionId: "left-session",
+    text: `${"y".repeat(4_990)}${String(index).padStart(10, "0")}`,
+    createdAt: new Date(Date.parse("2026-01-01T00:00:00Z") + index * 1_000).toISOString(),
+  }));
+  const flooded = await request(leftEndpoint, "/v1/state", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ version: 1, sessions: [], messages: flood, updates: [], journal: [] }),
+  });
+  assert.equal(flooded.status, 200, "oversized message flood is accepted, not rejected");
+  const floodState = (await flooded.json()).state;
+  const storedChars = floodState.messages.reduce((sum, item) => sum + item.text.length, 0);
+  assert.ok(storedChars <= 200_000, `stored message text stays under budget (${storedChars})`);
+  assert.ok(floodState.messages.some((item) => item.id === "flood-059"), "newest long message survives the budget");
+  assert.ok(!floodState.messages.some((item) => item.id === "flood-000"), "oldest long messages are dropped first");
+
   const invalid = await request(leftEndpoint, "/v1/state", {
     method: "POST",
     headers: { "content-type": "application/json" },

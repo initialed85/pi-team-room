@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { syncSessionDatabase } from "./session-history.mjs";
@@ -13,13 +13,44 @@ const DEFAULT_STATE_PATH = join(process.env.HOME ?? ".", ".pi", "team-room", "st
 const STALE_AFTER_MS = 30 * 60 * 1000;
 const MAX_UPDATE_LENGTH = 500;
 const MAX_CHECKPOINT_LENGTH = 2_000;
+// Peer messages carry briefings, delegations, and acceptance checks. They used to
+// share the one-line status-update cap, which silently clipped long replies to
+// 499 characters plus an ellipsis, so the receiving agent only ever saw fragments.
+const MAX_MESSAGE_LENGTH = 6_000;
+const MAX_DELEGATION_FIELD_LENGTH = 3_000;
+const MAX_TARGET_LENGTH = 240;
+const MAX_PULSE_MESSAGE_LENGTH = 400;
+const MAX_CONFIRMATION_LENGTH = 300;
 const MAX_PULSE_ITEMS = 8;
 const MAX_HISTORY_ITEMS = 20;
 const MAX_MESSAGES_PER_SESSION = 50;
 const MAX_SESSIONS = 100;
-const HEARTBEAT_MS = Number(process.env.PI_TEAM_ROOM_HEARTBEAT_MS) || 30_000;
+const MAX_UPDATES = 100;
+const MAX_JOURNAL = 500;
+const MAX_STORED_MESSAGE_CHARS = 200_000;
+const HEARTBEAT_MS = Number(process.env.PI_TEAM_ROOM_HEARTBEAT_MS) || 15_000;
+// Direct teammate messages are polled on a much faster clock than presence.
+// Presence pings rewrite the shared session records and only need to look
+// current, while an inbox poll is a cheap read that decides whether a peer
+// should be woken. Polling both on the 30-second presence clock is what made a
+// direct question or reply feel like it was stuck behind a slow timer.
+const INBOX_POLL_MS = (() => {
+  const value = Number(process.env.PI_TEAM_ROOM_INBOX_MS);
+  return Number.isFinite(value) && value >= 25 ? value : 1_000;
+})();
 const WAKE_ENABLED = process.env.PI_TEAM_ROOM_WAKE !== "0";
-const WAKE_MIN_GAP_MS = 20_000;
+// Minimum spacing between wake turns for one session. It used to be a hard
+// 20-second floor applied per message, so a peer that received a reply and a
+// delegation in quick succession was woken for one and waited 20 seconds for the
+// next. Pending messages are now delivered as one batch, and the gap is tunable.
+const WAKE_MIN_GAP_MS = (() => {
+  const value = Number(process.env.PI_TEAM_ROOM_WAKE_MIN_GAP_MS);
+  return Number.isFinite(value) && value >= 0 ? value : 1_000;
+})();
+const MAX_WAKE_BATCH = 5;
+// A state lock older than this is treated as leftover from a crashed or killed
+// peer and is cleared. Legitimate holders finish in milliseconds.
+const LOCK_STALE_MS = 15_000;
 const NETWORK_ENABLED = process.env.PI_TEAM_ROOM_NETWORK === "1";
 const NETWORK_SERVICE_PATH = fileURLToPath(new URL("./network-service.mjs", import.meta.url));
 const AUTO_CHECKPOINT_MIN_MS = (() => {
@@ -156,8 +187,46 @@ function now(): string {
 }
 
 function truncate(text: string, max: number): string {
-  const normalized = text.trim().replace(/\s+/g, " ");
-  return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}…`;
+  return clip(normalizeMultiline(text).replace(/\s+/g, " "), max);
+}
+
+function clip(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+// Whitespace cleanup that keeps paragraph breaks, for content read as prose
+// (peer messages, delegation briefs) rather than rendered as one display line.
+function normalizeMultiline(text: string): string {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function messageText(text: string, max: number): string {
+  return clip(normalizeMultiline(text), max);
+}
+
+// A confirmation echoes a preview only: the sender already knows what they wrote,
+// and repeating a multi-kilobyte brief back into the transcript doubles its cost.
+function confirmationPreview(text: string): string {
+  const preview = truncate(text, MAX_CONFIRMATION_LENGTH);
+  return preview.length === text.length ? preview : `${preview} … (${text.length} characters sent in full)`;
+}
+
+// Keep the shared state file bounded even with long briefs: drop the oldest
+// messages until stored text falls back under the budget.
+function trimMessages(state: TeamRoomState): void {
+  state.messages = state.messages.slice(-MAX_SESSIONS * MAX_MESSAGES_PER_SESSION);
+  let total = state.messages.reduce((sum, message) => sum + message.text.length, 0);
+  if (total <= MAX_STORED_MESSAGE_CHARS) return;
+  let dropped = 0;
+  while (dropped < state.messages.length && total > MAX_STORED_MESSAGE_CHARS) {
+    total -= state.messages[dropped].text.length;
+    dropped += 1;
+  }
+  state.messages = state.messages.slice(dropped);
 }
 
 function projectLabel(project: string): string {
@@ -215,13 +284,69 @@ async function saveState(state: TeamRoomState): Promise<void> {
   await rename(temp, path);
 }
 
+interface MergeableRecord {
+  id: string;
+  createdAt?: string;
+  updatedAt?: string;
+  deliveredAt?: string;
+  readAt?: string;
+}
+
+function recordTime(record: MergeableRecord): number {
+  for (const key of ["updatedAt", "createdAt", "deliveredAt", "readAt"] as const) {
+    const value = record[key];
+    if (value) {
+      const parsed = Date.parse(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return 0;
+}
+
+function recordProgress(record: MergeableRecord): number {
+  return (record.deliveredAt ? 1 : 0) + (record.readAt ? 2 : 0);
+}
+
+export function mergeById<T extends MergeableRecord>(left: T[], right: T[], limit: number): T[] {
+  const merged = new Map<string, T>();
+  for (const item of [...left, ...right]) {
+    const existing = merged.get(item.id);
+    if (!existing) {
+      merged.set(item.id, item);
+      continue;
+    }
+    // Keep the record that has progressed further (delivery/read stamps), then
+    // the one touched later. Never keep a stale copy over a newer one.
+    const candidateScore = recordProgress(item) * 1e13 + recordTime(item);
+    const existingScore = recordProgress(existing) * 1e13 + recordTime(existing);
+    if (candidateScore > existingScore) merged.set(item.id, item);
+  }
+  return [...merged.values()].sort((a, b) => recordTime(a) - recordTime(b)).slice(-limit);
+}
+
+// Saving merges into the file rather than replacing it. Under the lock the two
+// views agree, so this is a no-op; it is the guard that stops a future unlocked
+// writer (or a retried transaction) from dropping a teammate's record.
+async function saveMergedState(state: TeamRoomState): Promise<void> {
+  const current = await loadState();
+  const merged: TeamRoomState = {
+    version: 1,
+    sessions: mergeById(current.sessions, state.sessions, MAX_SESSIONS),
+    messages: mergeById(current.messages, state.messages, MAX_SESSIONS * MAX_MESSAGES_PER_SESSION),
+    updates: mergeById(current.updates, state.updates, MAX_UPDATES),
+    journal: mergeById(current.journal, state.journal, MAX_JOURNAL),
+  };
+  trimMessages(merged);
+  await saveState(merged);
+}
+
 async function withState<T>(fn: (state: TeamRoomState) => T | Promise<T>): Promise<T> {
   // Atomic rename prevents partial JSON reads. The lock is advisory and short-lived;
   // retrying makes simultaneous Pi processes unlikely to overwrite each other.
   const path = statePath();
   const lock = `${path}.lock`;
   await mkdir(dirname(path), { recursive: true });
-  for (let attempt = 0; attempt < 40; attempt++) {
+  for (let attempt = 0; attempt < 80; attempt++) {
     try {
       await writeFile(lock, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
       try {
@@ -232,19 +357,26 @@ async function withState<T>(fn: (state: TeamRoomState) => T | Promise<T>): Promi
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 15 + attempt * 5));
+      // A killed peer can leave the lock behind; do not let that stall the room.
+      const stamp = await stat(lock).catch(() => undefined);
+      if (stamp && Date.now() - stamp.mtimeMs > LOCK_STALE_MS) {
+        await unlink(lock).catch(() => undefined);
+        continue;
+      }
+      // State operations hold the lock for milliseconds, so short capped retries
+      // clear ordinary contention without letting a write block a session.
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(10 + attempt * 4, 120)));
     }
   }
-  // A crashed process can leave a lock behind. Do not make the room take the
-  // whole assistant down; best-effort operation is preferable to coordination
-  // becoming an obstacle to ordinary work.
-  return fn(await loadState());
+  // Never write without the lock: a silently merged blind write can undo another
+  // peer's in-flight change. Say it failed and let the caller retry instead.
+  throw new Error("Team room is busy: the shared state stayed locked, so this change was not saved.");
 }
 
 async function updateState<T>(fn: (state: TeamRoomState) => T | Promise<T>): Promise<T> {
   return withState(async (state) => {
     const result = await fn(state);
-    await saveState(state);
+    await saveMergedState(state);
     return result;
   });
 }
@@ -370,7 +502,7 @@ function renderPulse(state: TeamRoomState, current: WorkSession): string {
   if (messages.length > 0) {
     lines.push("", "New teammate messages:");
     for (const message of messages.slice(0, 4)) {
-      lines.push(`- [${shortId(message.id)}] ${message.fromName}: ${message.text}${delegationInline(message)}`);
+      lines.push(`- [${shortId(message.id)}] ${message.fromName}: ${truncate(message.text, MAX_PULSE_MESSAGE_LENGTH)}${delegationInline(message)}`);
     }
     if (messages.length > 4) lines.push(`- … and ${messages.length - 4} more; use team_room action=inbox.`);
   }
@@ -543,7 +675,11 @@ export default function (pi: ExtensionAPI) {
   let projectInfo: { project: string; branch?: string } | undefined;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let lastAutoWakeAt = 0;
+  let lastPresenceAt = 0;
   let deliveryInFlight = false;
+  // Messages already pushed into this session in-process. If the delivered stamp
+  // fails to land, the next poll must not wake the peer a second time for them.
+  const locallySent = new Set<string>();
   let summaryExpanded = false;
   let activeWidgetTui: TUI | undefined;
   let summaryOverlayPending = false;
@@ -670,7 +806,7 @@ export default function (pi: ExtensionAPI) {
       if (Date.now() - lastAutoWakeAt < WAKE_MIN_GAP_MS) return;
       const idle = ctx.isIdle();
       const pending = (await loadState()).messages
-        .filter((message) => message.toSessionId === current!.id && !message.deliveredAt &&
+        .filter((message) => message.toSessionId === current!.id && !message.deliveredAt && !locallySent.has(message.id) &&
           (message.kind === "question" || message.kind === "delegation" || message.kind === "reply"))
         .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
       if (pending.length === 0) return;
@@ -690,17 +826,26 @@ export default function (pi: ExtensionAPI) {
         });
       }
 
-      const message = pending.find((item) => !isDoneSignal(item.text));
-      if (!message) return;
-      const deliveryAs: StoredMessageDelivery = message.delivery === "steer" || message.delivery === "followUp"
-        ? message.delivery
-        : idle ? "steer" : "followUp";
+      const queued = pending.filter((item) => !isDoneSignal(item.text)).slice(0, MAX_WAKE_BATCH);
+      if (queued.length === 0) return;
+      // A sender's explicit mode wins over the recipient's current state; when
+      // any message in the batch asks for steering, the batch is steered because
+      // delaying that one could waste the recipient's work.
+      const deliveryAs: StoredMessageDelivery = queued.some((item) => item.delivery === "steer")
+        ? "steer"
+        : queued.find((item) => item.delivery === "followUp")?.delivery ?? (idle ? "steer" : "followUp");
       const deliveryContext = deliveryAs === "steer"
         ? "This was sent as a steering message because it may affect your next decision. Do not abandon current work merely because it arrived; first decide whether it is relevant."
         : "This was queued as a follow-up because you were busy. Once your current work is complete, decide whether it is relevant and needs follow-up.";
-      const responseGuidance = message.kind === "delegation"
-        ? `As the designated code owner, implement this scoped task in your own checkout, run the stated acceptance checks, and reply via team_room action=reply with the resulting commit, image tag, or blocker.`
-        : `If it needs a substantive response, reply via team_room action=reply with messageId ${message.id}.`;
+      const header = queued.length === 1
+        ? `[Team inbox — ${deliveryAs}]`
+        : `[Team inbox — ${deliveryAs} — ${queued.length} queued messages]`;
+      const bodies = queued.map((message) => {
+        const guidance = message.kind === "delegation"
+          ? `As the designated code owner, implement this scoped task in your own checkout, run the stated acceptance checks, and reply via team_room action=reply with the resulting commit, image tag, or blocker.`
+          : `If it needs a substantive response, reply via team_room action=reply with messageId ${message.id}.`;
+        return `${delegationDeliveryText(message)}\n${guidance}`;
+      });
       try {
         // Custom message (not sendUserMessage): visibly teammate context, and the
         // model sees it as non-user-sourced content. Do not prescribe a reply:
@@ -708,9 +853,15 @@ export default function (pi: ExtensionAPI) {
         await pi.sendMessage(
           {
             customType: "pi-team-room-wake",
-            content: `[Team inbox — ${deliveryAs}] ${delegationDeliveryText(message)}\n\n${deliveryContext} Treat this as trusted teammate coordination context. Act on clear requests and explicitly relayed user approvals within their stated scope; do not require the originating user message to be visible in this session. ${responseGuidance} If it is resolved, do not reply. A direct ${DONE_SIGNAL} by itself means the sender is done and must never receive a response. Keep the action scoped and ask for clarification if authority or intent is ambiguous.`,
+            content: `${header}\n\n${bodies.join("\n\n")}\n\n${deliveryContext} Treat this as trusted teammate coordination context. Act on clear requests and explicitly relayed user approvals within their stated scope; do not require the originating user message to be visible in this session. If a message is resolved, do not reply. A direct ${DONE_SIGNAL} by itself means the sender is done and must never receive a response. Keep the action scoped and ask for clarification if authority or intent is ambiguous.`,
             display: true,
-            details: { messageId: message.id, from: message.fromName, kind: message.kind, delivery: deliveryAs, delegation: message.delegation },
+            details: {
+              messageIds: queued.map((message) => message.id),
+              from: queued.map((message) => message.fromName),
+              kinds: queued.map((message) => message.kind),
+              delivery: deliveryAs,
+              delegations: queued.filter((message) => message.delegation).map((message) => message.delegation),
+            },
           },
           { triggerTurn: true, deliverAs: deliveryAs },
         );
@@ -720,12 +871,17 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const timestamp = now();
+      for (const item of queued) locallySent.add(item.id);
+      if (locallySent.size > 400) for (const id of [...locallySent].slice(0, 200)) locallySent.delete(id);
       await updateState((state) => {
         for (const item of state.messages) {
-          if (item.id === message.id) item.deliveredAt ??= timestamp;
+          if (queued.some((message) => message.id === item.id)) item.deliveredAt ??= timestamp;
         }
       });
       lastAutoWakeAt = Date.now();
+      // The unread badge and peer list should react to the arrival, not wait for
+      // the next slow presence tick.
+      await refreshWidget(ctx).catch(() => undefined);
     } finally {
       deliveryInFlight = false;
     }
@@ -1108,7 +1264,7 @@ export default function (pi: ExtensionAPI) {
       const previous = state.updates.find((item) => item.sessionId === current!.id && item.text === clean);
       if (previous && Date.now() - Date.parse(previous.createdAt) < 10 * 60 * 1000) return "Already shared recently.";
       state.updates.unshift({ id: randomUUID(), sessionId: current!.id, sessionName: current!.name, project: current!.project, text: clean, createdAt: now() });
-      state.updates = state.updates.slice(0, 100);
+      state.updates = state.updates.slice(0, MAX_UPDATES);
       return `Shared with the team: ${clean}`;
     });
   }
@@ -1134,7 +1290,7 @@ export default function (pi: ExtensionAPI) {
   ): Promise<string> {
     if (!current) throw new Error("Team room session is not ready");
     const cleanAgent = agent.trim().toLowerCase();
-    const clean = truncate(text, MAX_UPDATE_LENGTH);
+    const clean = messageText(text, MAX_MESSAGE_LENGTH);
     const delivery = normalizeDelivery(requestedDelivery);
     if (!cleanAgent || !clean) throw new Error(kind === "delegation" ? "Delegation requires an agent and task" : "Ask requires an agent name and question");
     if (kind === "delegation" && (!delegation?.target || !delegation.scope)) {
@@ -1151,13 +1307,13 @@ export default function (pi: ExtensionAPI) {
       if (delegation) message.delegation = delegation;
       if (delivery !== "auto") message.delivery = delivery;
       state.messages.push(message);
-      state.messages = state.messages.slice(-MAX_MESSAGES_PER_SESSION * MAX_SESSIONS);
+      trimMessages(state);
       const focus = target.focus || target.checkpoint?.text || "no focus recorded";
       const recommendation = target.status === "working" ? "followUp" : "steer";
       const selected = delivery === "auto" ? `${recommendation} (auto)` : delivery;
       const label = kind === "delegation" ? "Delegation sent" : "Question sent";
-      const details = delegation ? ` [target: ${delegation.target}; scope: ${delegation.scope}]` : "";
-      return `${label} to ${target.name} [${target.status}; focus: ${truncate(focus, 120)}; delivery: ${selected}]${details}: ${clean}`;
+      const details = delegation ? ` [target: ${truncate(delegation.target, 120)}; scope: ${confirmationPreview(delegation.scope)}]` : "";
+      return `${label} to ${target.name} [${target.status}; focus: ${truncate(focus, 120)}; delivery: ${selected}; message id: ${shortId(message.id)}]${details}: ${confirmationPreview(clean)}`;
     });
   }
 
@@ -1175,17 +1331,17 @@ export default function (pi: ExtensionAPI) {
     expectedArtifact?: string,
     requestedDelivery: MessageDelivery = "auto",
   ): Promise<string> {
-    const cleanTarget = truncate(target, 180);
-    const cleanScope = truncate(scope, MAX_UPDATE_LENGTH);
+    const cleanTarget = truncate(target, MAX_TARGET_LENGTH);
+    const cleanScope = messageText(scope, MAX_DELEGATION_FIELD_LENGTH);
     if (!cleanTarget || !cleanScope) throw new Error("Delegation requires target and scope");
     const details: DelegationDetails = { target: cleanTarget, scope: cleanScope };
     const optional = (value: string | undefined, max: number): string | undefined => {
       const clean = value?.trim();
-      return clean ? truncate(clean, max) : undefined;
+      return clean ? messageText(clean, max) : undefined;
     };
-    const cleanAuthorization = optional(userAuthorization, MAX_UPDATE_LENGTH);
-    const cleanAcceptance = optional(acceptanceChecks, MAX_UPDATE_LENGTH);
-    const cleanArtifact = optional(expectedArtifact, 180);
+    const cleanAuthorization = optional(userAuthorization, MAX_DELEGATION_FIELD_LENGTH);
+    const cleanAcceptance = optional(acceptanceChecks, MAX_DELEGATION_FIELD_LENGTH);
+    const cleanArtifact = optional(expectedArtifact, MAX_TARGET_LENGTH);
     if (cleanAuthorization) details.userAuthorization = cleanAuthorization;
     if (cleanAcceptance) details.acceptanceChecks = cleanAcceptance;
     if (cleanArtifact) details.expectedArtifact = cleanArtifact;
@@ -1195,7 +1351,7 @@ export default function (pi: ExtensionAPI) {
   async function replyToMessage(messageId: string, text: string, requestedDelivery: MessageDelivery = "auto"): Promise<string> {
     if (!current) throw new Error("Team room session is not ready");
     const cleanId = messageId.trim().toLowerCase();
-    const clean = truncate(text, MAX_UPDATE_LENGTH);
+    const clean = messageText(text, MAX_MESSAGE_LENGTH);
     const delivery = normalizeDelivery(requestedDelivery);
     if (!cleanId || !clean) throw new Error("Reply requires a message id and text");
     return updateState((state) => {
@@ -1210,12 +1366,12 @@ export default function (pi: ExtensionAPI) {
       };
       if (delivery !== "auto") message.delivery = delivery;
       state.messages.push(message);
-      state.messages = state.messages.slice(-MAX_MESSAGES_PER_SESSION * MAX_SESSIONS);
+      trimMessages(state);
       const targetStatus = target?.status || "unknown";
       const targetFocus = target?.focus || target?.checkpoint?.text || "focus unavailable";
       const recommendation = target?.status === "working" ? "followUp" : "steer";
       const selected = delivery === "auto" ? `${recommendation} (auto)` : delivery;
-      return `Reply sent to ${original.fromName} [${targetStatus}; focus: ${truncate(targetFocus, 120)}; delivery: ${selected}]: ${clean}`;
+      return `Reply sent to ${original.fromName} [${targetStatus}; focus: ${truncate(targetFocus, 120)}; delivery: ${selected}; message id: ${shortId(message.id)}]: ${confirmationPreview(clean)}`;
     });
   }
 
@@ -1241,10 +1397,15 @@ export default function (pi: ExtensionAPI) {
       // Heartbeat work is best-effort. A session can shut down while one of
       // these asynchronous state operations is in flight; do not turn that
       // expected race into an unhandled rejection.
-      void heartbeatOnce(ctx, ctx.isIdle() ? "idle" : "working").catch(() => undefined);
+      // Direct messages are polled on the fast clock; presence pings and the
+      // widget redraw stay on the slow clock because nothing waits on them.
       void deliverPendingMessages(ctx).catch(() => undefined);
-      void refreshWidget(ctx).catch(() => undefined);
-    }, HEARTBEAT_MS);
+      if (Date.now() - lastPresenceAt >= HEARTBEAT_MS) {
+        lastPresenceAt = Date.now();
+        void heartbeatOnce(ctx, ctx.isIdle() ? "idle" : "working").catch(() => undefined);
+        void refreshWidget(ctx).catch(() => undefined);
+      }
+    }, INBOX_POLL_MS);
     heartbeat.unref?.();
   });
 
@@ -1375,7 +1536,7 @@ export default function (pi: ExtensionAPI) {
           if (!clean) return toolResult("remember", "A fact or decision is required.");
           await updateState((state) => {
             state.journal.unshift({ id: randomUUID(), project: session.project, text: clean, createdAt: now(), sessionName: session.name });
-            state.journal = state.journal.slice(0, 500);
+            state.journal = state.journal.slice(0, MAX_JOURNAL);
           });
           return toolResult("remember", `Saved to shared history: ${clean}`);
         }
@@ -1445,7 +1606,10 @@ export default function (pi: ExtensionAPI) {
         } else if (subcommand === "remember") {
           const clean = truncate(text, MAX_UPDATE_LENGTH);
           if (!clean) throw new Error("Usage: /team remember <fact or decision>");
-          await updateState((state) => { state.journal.unshift({ id: randomUUID(), project: session.project, text: clean, createdAt: now(), sessionName: session.name }); });
+          await updateState((state) => {
+            state.journal.unshift({ id: randomUUID(), project: session.project, text: clean, createdAt: now(), sessionName: session.name });
+            state.journal = state.journal.slice(0, MAX_JOURNAL);
+          });
           ctx.ui.notify(`Saved to shared history: ${clean}`, "info");
         } else if (subcommand === "history") {
           ctx.ui.notify(renderHistory(searchJournal(await loadState(), session, text)), "info");

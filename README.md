@@ -153,7 +153,7 @@ When a session shuts down, if it was meaningfully active but never saved an expl
 
 ## Wake-up (optional)
 
-If a teammate sends a **direct** question or reply to an idle-but-open session, the heartbeat delivers it as trusted teammate coordination context and triggers an agent turn, so the peer can actually answer without anyone prompting that window. For a busy session, automatic delivery queues a non-interrupting `followUp` for after the current work finishes. Senders can explicitly request `steer` with `delivery: "steer"` (or `/team steer` / `--steer`) when delaying could waste work; Pi delivers that after the current tool-call batch, before the next model call, but it still does not hard-abort the running task. Clear peer requests and explicitly relayed user approvals may be acted on within their stated scope; the recipient should ask when authority or intent is ambiguous. In either mode, the recipient decides whether the message is relevant and whether it needs follow-up. Broadcasts/updates never wake anyone. The exact `🐈` shutdown signal is marked delivered without triggering a turn, so it cannot start an acknowledgement loop. Set `PI_TEAM_ROOM_WAKE=0` per-session to disable. Fully closed windows stay human-gated.
+If a teammate sends a **direct** question or reply to an idle-but-open session, the heartbeat delivers it as trusted teammate coordination context and triggers an agent turn, so the peer can actually answer without anyone prompting that window. Delivery runs on its own inbox clock (`PI_TEAM_ROOM_INBOX_MS`, default one second), separate from the slower presence clock, so a direct message reaches an open peer in about a second plus the wake gap. Messages that queue up in one window arrive as a **single wake turn** carrying all of them, so a burst of coordination does not turn into a burst of interruptions. For a busy session, automatic delivery queues a non-interrupting `followUp` for after the current work finishes. Senders can explicitly request `steer` with `delivery: "steer"` (or `/team steer` / `--steer`) when delaying could waste work; Pi delivers that after the current tool-call batch, before the next model call, but it still does not hard-abort the running task. Clear peer requests and explicitly relayed user approvals may be acted on within their stated scope; the recipient should ask when authority or intent is ambiguous. In either mode, the recipient decides whether the message is relevant and whether it needs follow-up. Broadcasts/updates never wake anyone. The exact `🐈` shutdown signal is marked delivered without triggering a turn, so it cannot start an acknowledgement loop. Set `PI_TEAM_ROOM_WAKE=0` per-session to disable. Fully closed windows stay human-gated.
 
 ## Network sync (experimental)
 
@@ -181,13 +181,14 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 
 - Presence is ephemeral-ish: stale sessions are hidden from the pulse after 30 minutes, but their last checkpoint and history remain.
 - Updates are capped and deduplicated to avoid turning the team room into a tool-call transcript.
+- Text budgets are split by role. One-line surfaces (status updates, journal facts, pulse lines, send confirmations) are capped and flattened: 500 characters for an update, 2,000 for a checkpoint, 400 per pulse message line, 300 for a confirmation preview. Direct teammate messages and delegation briefs are stored as prose with their paragraph breaks and get their own budgets: 6,000 characters of message text and 3,000 per delegation field. A pulse or confirmation line is a preview that says how long the full message was; `inbox` and wakes always carry the whole brief. Shared state additionally holds at most 200,000 characters of stored message text, dropping the oldest messages first.
 - The pulse is injected into the current turn's system prompt, so it does not create persistent transcript clutter.
 - Senders get a current-but-advisory peer status/focus snapshot when asking; auto delivery is resolved again by the recipient at delivery time because status can change between the two.
 - Each session gets a durable session id, allowing messages to target a specific peer even when display names repeat.
 - The extension reads and writes the state atomically enough for local peer processes using a lock file and rename-based writes.
 - Shared state is best-effort: if another Pi instance is unavailable, the local session keeps working.
 - All sessions on this machine share one room. Project/repository paths and branches are retained as labels so parallel work remains distinguishable without making any project invisible.
-- `npm test` runs core, network, and session-history integration harnesses using isolated extension instances and temporary state files.
+- `npm test` runs core, network, and session-history integration harnesses using isolated extension instances and temporary state files. The harnesses reuse Pi's own bundled `jiti` and peer dependencies, resolved from the managed install layout (`~/.pi/agent/install/releases/<version>/node_modules`, following `PI_MANAGED_INSTALL_ROOT`); set `PI_TEAM_ROOM_TEST_NODE_MODULES` to point at a specific `node_modules` directory when Pi lives somewhere unusual.
 - Session history is a private local projection of Pi JSONL. It is intentionally separate from team-room coordination state and is never network-synchronized by this extension.
 
 ## Knobs
@@ -197,8 +198,10 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 | `PI_TEAM_ROOM_STATE` | `~/.pi/team-room/state.json` | Shared state file |
 | `PI_SESSION_HISTORY` | `1` | Maintain per-session SQLite history sidecars (`0` disables automatic indexing) |
 | `PI_SESSION_HISTORY_DIR` | `~/.pi/agent/session-history` | Per-session SQLite sidecar directory |
-| `PI_TEAM_ROOM_HEARTBEAT_MS` | `30000` | Presence ping + inbox poll period |
+| `PI_TEAM_ROOM_HEARTBEAT_MS` | `15000` | Presence ping, widget refresh, and summary clock |
 | `PI_TEAM_ROOM_WAKE` | `1` | Allow automatic direct-message delivery and wake/queue behavior (`0` disables) |
+| `PI_TEAM_ROOM_INBOX_MS` | `1000` | Direct-message poll period (independent of the presence clock) |
+| `PI_TEAM_ROOM_WAKE_MIN_GAP_MS` | `1000` | Minimum gap between automatic wake turns; queued messages coalesce into one |
 | `PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS` | `120000` | Minimum session activity before shutdown auto-checkpoint |
 | `PI_TEAM_ROOM_NETWORK` | `0` | Start the per-host network sync node (`1` enables) |
 | `PI_TEAM_ROOM_SHARED_SECRET` | unset | Required shared bearer secret for network sync |

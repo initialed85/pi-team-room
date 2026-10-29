@@ -18,6 +18,9 @@ const MAX_SESSIONS = 100;
 const MAX_MESSAGES = 5_000;
 const MAX_UPDATES = 100;
 const MAX_JOURNAL = 500;
+// Longer teammate briefs must not turn a state snapshot into a multi-megabyte
+// payload: bound stored message text the same way the extension does locally.
+const MAX_STORED_MESSAGE_CHARS = 200_000;
 const NETWORK_ENABLED = process.env.PI_TEAM_ROOM_NETWORK === "1";
 const MDNS_ENABLED = process.env.PI_TEAM_ROOM_MDNS !== "0";
 
@@ -55,12 +58,23 @@ function validState(value) {
     Array.isArray(candidate.updates) && Array.isArray(candidate.journal);
 }
 
+function budgetedMessages(messages) {
+  let total = messages.reduce((sum, message) => sum + String(message.text ?? "").length, 0);
+  if (total <= MAX_STORED_MESSAGE_CHARS) return messages;
+  let dropped = 0;
+  while (dropped < messages.length && total > MAX_STORED_MESSAGE_CHARS) {
+    total -= String(messages[dropped].text ?? "").length;
+    dropped += 1;
+  }
+  return messages.slice(dropped);
+}
+
 function cleanState(value) {
   if (!validState(value)) return emptyState();
   return {
     version: 1,
     sessions: value.sessions.filter((item) => item && typeof item === "object" && typeof item.id === "string").slice(-MAX_SESSIONS),
-    messages: value.messages.filter((item) => item && typeof item === "object" && typeof item.id === "string").slice(-MAX_MESSAGES),
+    messages: budgetedMessages(value.messages.filter((item) => item && typeof item === "object" && typeof item.id === "string").slice(-MAX_MESSAGES)),
     updates: value.updates.filter((item) => item && typeof item === "object" && typeof item.id === "string").slice(-MAX_UPDATES),
     journal: value.journal.filter((item) => item && typeof item === "object" && typeof item.id === "string").slice(-MAX_JOURNAL),
   };
@@ -145,7 +159,7 @@ function mergeStates(left, right) {
   return {
     version: 1,
     sessions: mergeSessions(left.sessions, right.sessions),
-    messages: mergeById(left.messages, right.messages, MAX_MESSAGES),
+    messages: budgetedMessages(mergeById(left.messages, right.messages, MAX_MESSAGES)),
     updates: mergeById(left.updates, right.updates, MAX_UPDATES),
     journal: mergeById(left.journal, right.journal, MAX_JOURNAL),
   };

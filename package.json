@@ -1,6 +1,6 @@
 {
   "name": "pi-team-room",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "description": "A quiet, machine-wide shared context room for peer Pi sessions",
   "keywords": ["pi-package"],

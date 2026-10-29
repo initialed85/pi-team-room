@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -9,18 +9,75 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const stateDir = await mkdtemp(join("/tmp", "pi-team-room-test-"));
 const statePath = join(stateDir, "state.json");
 process.env.PI_TEAM_ROOM_STATE = statePath;
-process.env.PI_TEAM_ROOM_HEARTBEAT_MS = "25";
+process.env.PI_TEAM_ROOM_HEARTBEAT_MS = "500";
+process.env.PI_TEAM_ROOM_INBOX_MS = "200";
 process.env.PI_TEAM_ROOM_WAKE = "1";
+// The production wake gap keeps a peer from being interrupted in a loop, and the
+// harness runs in about a second, so it needs a faster clock.
+process.env.PI_TEAM_ROOM_WAKE_MIN_GAP_MS = "10";
 process.env.PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS = "1";
 
 // Use Pi's own transpiler and bundled peer dependencies. The runtime network
 // dependency is installed from package.json; only core Pi peers need wiring for
 // the harness, which works with both the Linux and macOS Pi installs.
-const piBin = execFileSync("sh", ["-lc", "command -v pi"], { encoding: "utf8" }).trim();
-const piCli = realpathSync(piBin);
-const piRoot = resolve(dirname(piCli), "../..");
-const jitiPath = join(piRoot, "node_modules", "jiti", "lib", "jiti.mjs");
-const bundledModules = join(piRoot, "node_modules");
+//
+// `pi` on PATH is a launcher script, not a symlink into the release, so walking
+// up from it cannot be assumed to reach the release's node_modules: the managed
+// installer keeps everything under ~/.pi/agent/install/releases/<version>/ and
+// picks the version from install/current-version. Resolve the release directory
+// explicitly instead of guessing the launcher's layout - the old assumption
+// (`<launcher>/../../node_modules`) resolved to ~/.pi/node_modules and every
+// harness run died with ERR_MODULE_NOT_FOUND for jiti.
+function nodeModulesUnder(candidate) {
+  let dir = candidate;
+  for (let depth = 0; depth < 8; depth += 1) {
+    const modules = join(dir, "node_modules");
+    if (existsSync(join(modules, "jiti", "lib", "jiti.mjs"))) return modules;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
+function managedReleaseModules() {
+  const installRoot = process.env.PI_MANAGED_INSTALL_ROOT || join(process.env.HOME ?? ".", ".pi", "agent", "install");
+  for (const releases of [join(installRoot, "releases"), installRoot]) {
+    if (!existsSync(releases)) continue;
+    const candidates = readdirSync(releases, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+      .map((entry) => join(releases, entry.name))
+      .flatMap((dir) => [join(dir, "node_modules"), join(dir, "node_modules", "node_modules")])
+      .filter((modules) => existsSync(join(modules, "jiti", "lib", "jiti.mjs")));
+    if (candidates.length > 0) {
+      candidates.sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+      return candidates.at(-1);
+    }
+  }
+  return undefined;
+}
+
+function resolveBundledModules() {
+  const explicit = process.env.PI_TEAM_ROOM_TEST_NODE_MODULES;
+  if (explicit) return resolve(explicit);
+  try {
+    const piBin = execFileSync("sh", ["-lc", "command -v pi"], { encoding: "utf8" }).trim();
+    if (piBin) {
+      const found = nodeModulesUnder(dirname(realpathSync(piBin)));
+      if (found) return found;
+    }
+  } catch {
+    // pi is not on PATH in this shell; fall through to the managed layout.
+  }
+  const managed = managedReleaseModules();
+  if (managed) return managed;
+  throw new Error(
+    "Could not find a Pi install that bundles jiti. Set PI_TEAM_ROOM_TEST_NODE_MODULES to that node_modules directory.",
+  );
+}
+
+const bundledModules = resolveBundledModules();
+const jitiPath = join(bundledModules, "jiti", "lib", "jiti.mjs");
 const localModules = join(root, "node_modules");
 let madeModulesLink = false;
 const madePeerLinks = [];
@@ -178,7 +235,14 @@ try {
       if (value) return value;
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
     }
-    throw new Error(`Timed out waiting for ${label}`);
+    const diagnostic = existsSync(statePath)
+      ? JSON.parse(readFileSync(statePath, "utf8")).messages
+        .slice(-8)
+        .map((message) => `${message.kind} ${message.id.slice(0, 8)} ${message.fromName}->${message.toSessionId.slice(0, 8)}` +
+          ` delivered=${!!message.deliveredAt} read=${!!message.readAt} text=${JSON.stringify(String(message.text).slice(0, 24))}`)
+        .join("; ")
+      : "no state file";
+    throw new Error(`Timed out waiting for ${label}. Recent messages: ${diagnostic}`);
   }
 
   const alpha = makePeer("aaaaaaaa-1111-2222-3333-444444444444", "alpha", true, "/tmp/project-alpha");
@@ -354,6 +418,131 @@ try {
   assert.ok(doneMessage?.deliveredAt, "terminal signal is marked delivered");
   assert.equal((await call(echo, { action: "reply", messageId: doneMessage.id.slice(0, 8), text: "thanks" })).includes("do not reply"), true);
 
+  // Peer messages are briefings, not headlines: a long multi-paragraph reply must
+  // arrive intact instead of being silently clipped to the status-update cap.
+  const golf = makePeer("0f0f0f0f-1111-2222-3333-444444444444", "golf", true, "/tmp/project-golf");
+  const hotel = makePeer("14141414-1111-2222-3333-444444444444", "hotel", true, "/tmp/project-hotel");
+  await golf.handlers.session_start({}, golf.ctx);
+  await hotel.handlers.session_start({}, hotel.ctx);
+  const longBrief = [
+    "Longhorn pointer: reserve headroom before asking for a PVC. " + "a".repeat(300),
+    "Layout pointer: one Application per app directory. " + "b".repeat(300),
+    "Tail pointer: pin nothing, use Recreate for RWO volumes. pointer three " + "c".repeat(300),
+  ].join("\n\n");
+  const tailMarker = `pointer three ${"c".repeat(60)}`;
+  const longReply = await call(golf, { action: "reply", messageId: "not-a-real-id", text: longBrief });
+  assert.match(longReply, /No message matching/, "reply still validates the message id");
+  const longQuestion = await call(golf, { action: "ask", agent: "hotel", text: longBrief });
+  assert.match(longQuestion, /Question sent to hotel/, "long brief is accepted");
+  assert.ok(!longQuestion.includes(tailMarker), "the confirmation echoes a preview instead of the whole brief");
+  assert.match(longQuestion, /sent in full/, "the confirmation says the full brief was sent");
+  assert.match(longQuestion, /message id: [0-9a-f]{8}/, "the confirmation reports the message id");
+  await waitFor("long brief wake", () => hotel.sendCalls.find((entry) => entry.message?.content?.includes(tailMarker)));
+  const longWake = hotel.sendCalls.find((entry) => entry.message?.content?.includes(tailMarker));
+  assert.ok(longWake, "a long peer brief wakes the recipient with its tail intact");
+  assert.match(longWake.message.content, /Longhorn pointer/, "wake keeps the start of the brief");
+  const storedLongBrief = JSON.parse(readFileSync(statePath, "utf8")).messages
+    .find((message) => message.text.includes(tailMarker));
+  assert.equal(storedLongBrief.text, longBrief, "peer message text is stored verbatim, not clipped");
+  assert.equal(storedLongBrief.text.split("\n\n").length, 3, "paragraph breaks survive the round trip");
+  const pulseWithLongBrief = await call(hotel, { action: "pulse" });
+  const pulseMessageLine = pulseWithLongBrief.split("\n").find((line) => line.includes("golf:"));
+  assert.ok(pulseMessageLine, "pulse shows the unread peer message line");
+  assert.ok(pulseMessageLine.length < 600, "pulse keeps a bounded single line for a long brief");
+  assert.ok(!pulseMessageLine.includes(tailMarker), "pulse truncates for display only, not in storage");
+  assert.ok(pulseMessageLine.endsWith("…"), "pulse marks the truncation it applies");
+  const hotelInbox = await call(hotel, { action: "inbox" });
+  assert.ok(hotelInbox.includes(tailMarker), "inbox renders the full peer message body");
+  const oversizeBrief = await call(golf, { action: "ask", agent: "hotel", text: "x".repeat(20_000) });
+  assert.match(oversizeBrief, /sent in full/, "oversized brief is bounded but reported");
+  const storedOversize = JSON.parse(readFileSync(statePath, "utf8")).messages
+    .find((message) => message.text.startsWith("xxxxx") && message.text.length > 1_000);
+  assert.equal(storedOversize.text.length, 6_000, "peer messages are capped at the message budget");
+  assert.ok(storedOversize.text.endsWith("…"), "capped peer messages say so");
+
+  // Several queued messages reach one peer as a single wake turn rather than one
+  // wake every throttle interval.
+  const india = makePeer("15151515-1111-2222-3333-444444444444", "india", true, "/tmp/project-india");
+  await india.handlers.session_start({}, india.ctx);
+  india.sendMessageFailures = 100;
+  assert.match(await call(golf, { action: "ask", agent: "india", text: "first queued brief" }), /Question sent to india/);
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 80));
+  assert.equal(india.sendCalls.length, 0, "a failed send is not recorded");
+  assert.match(await call(golf, { action: "ask", agent: "india", text: "second queued brief" }), /Question sent to india/);
+  india.sendMessageFailures = 0;
+  const batchWake = await waitFor("coalesced wake", () => india.sendCalls.find((entry) => entry.message?.content?.includes("second queued brief")));
+  assert.ok(batchWake, "pending messages arrive together");
+  assert.match(batchWake.message.content, /first queued brief/, "the batch carries every pending message");
+  assert.match(batchWake.message.content, /2 queued messages/, "the batch says how many arrived");
+  assert.equal(india.sendCalls.length, 1, "one wake turn carries the batch");
+  const batchState = JSON.parse(readFileSync(statePath, "utf8")).messages.filter((message) =>
+    message.text === "first queued brief" || message.text === "second queued brief");
+  assert.equal(batchState.length, 2, "both messages are stored");
+  const settled = await waitFor("delivery stamps land", () =>
+    JSON.parse(readFileSync(statePath, "utf8")).messages
+      .filter((message) => message.text === "first queued brief" || message.text === "second queued brief")
+      .every((message) => message.deliveredAt));
+  assert.ok(settled, "both messages are marked delivered");
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 400));
+  assert.equal(india.sendCalls.length, 1, "a delivered batch is not replayed as a second wake");
+
+  // Direct messages should feel immediate: the inbox poll runs on its own fast
+  // clock, not on the 30-second presence clock.
+  const juliet = makePeer("16161616-1111-2222-3333-444444444444", "juliet", true, "/tmp/project-juliet");
+  await juliet.handlers.session_start({}, juliet.ctx);
+  await call(golf, { action: "ask", agent: "juliet", text: "wake me promptly" });
+  // Measured from the moment the message is stored, so this times delivery and
+  // not the write contention of the harness itself.
+  const sentAt = Date.now();
+  const promptWake = await waitFor("prompt wake", () => juliet.sendCalls.find((entry) => entry.message?.content?.includes("wake me promptly")));
+  const wakeLatency = Date.now() - sentAt;
+  assert.ok(promptWake, "direct message is delivered without a manual prompt");
+  assert.ok(wakeLatency <= 1_500, `direct message wakes a peer promptly (${wakeLatency}ms on the fast inbox clock)`);
+
+  // A lock left behind by a killed peer must not stall the room.
+  const staleLock = `${statePath}.lock`;
+  await writeFile(staleLock, "999999\n", { mode: 0o600 });
+  const longAgo = new Date(Date.now() - 60_000);
+  await utimes(staleLock, longAgo, longAgo);
+  const staleStartedAt = Date.now();
+  assert.match(await call(bravo, { action: "update", text: "recovered after a leftover lock" }), /Shared/);
+  assert.ok(Date.now() - staleStartedAt < 1_000, "a stale lock is cleared instead of blocking writes");
+  assert.ok(JSON.parse(readFileSync(statePath, "utf8")).updates.some((update) => update.text === "recovered after a leftover lock"), "the write landed after stealing the stale lock");
+
+  // A peer that wrote into the file while this session was shut out of the lock
+  // must not be overwritten: the last-resort write merges instead of replacing.
+  const stateBeforeContention = JSON.parse(readFileSync(statePath, "utf8"));
+  const foreignMessage = {
+    id: "00000000-0000-4000-8000-000000000001",
+    kind: "question",
+    fromSessionId: "outside-session",
+    fromName: "outside",
+    toSessionId: hotel.ctx.sessionManager.getSessionId(),
+    text: "written by another peer while this session was locked out",
+    createdAt: new Date().toISOString(),
+  };
+  await writeFile(statePath, JSON.stringify({ ...stateBeforeContention, messages: [...stateBeforeContention.messages, foreignMessage] }, null, 2));
+  assert.match(await call(golf, { action: "ask", agent: "hotel", text: "written while another peer held the file" }), /Question sent to hotel/);
+  const stateAfterContention = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.ok(stateAfterContention.messages.some((message) => message.id === foreignMessage.id), "a concurrent write is not overwritten");
+
+  // The merge helper used by that path keeps the record that progressed further,
+  // so a stale copy cannot undo a delivered or read marker.
+  const merged = extension.mergeById(
+    [
+      { id: "old", text: "stale copy", createdAt: "2026-01-01T00:00:00.000Z" },
+      { id: "gone", createdAt: "2026-01-01T00:00:00.000Z" },
+    ],
+    [
+      { id: "old", text: "delivered copy", createdAt: "2026-01-01T00:00:00.000Z", deliveredAt: "2026-01-02T00:00:00.000Z" },
+      { id: "new", createdAt: "2026-01-03T00:00:00.000Z" },
+    ],
+    3,
+  );
+  assert.deepEqual(merged.map((item) => item.id), ["old", "gone", "new"], "ids from both sides are kept");
+  assert.equal(merged.find((item) => item.id === "old").text, "delivered copy", "a delivered record wins over a stale one");
+  assert.deepEqual(extension.mergeById([{ id: "a", createdAt: "2026-01-01T00:00:00.000Z" }], [{ id: "b", createdAt: "2026-01-02T00:00:00.000Z" }], 1).map((item) => item.id), ["b"], "the oldest records are trimmed to the limit");
+
   // Summary cards, widgets, and shutdown breadcrumbs are durable/local UI behavior.
   await call(bravo, { action: "update", text: "bravo delivered the cross-project test" });
   await call(bravo, { action: "ask", agent: "alpha", text: "leave this unread for the compact indicator" });
@@ -462,6 +651,10 @@ try {
   await foxtrot.handlers.session_shutdown({}, foxtrot.ctx);
   await manual.handlers.session_shutdown({}, manual.ctx);
   await echo.handlers.session_shutdown({}, echo.ctx);
+  await golf.handlers.session_shutdown({}, golf.ctx);
+  await hotel.handlers.session_shutdown({}, hotel.ctx);
+  await india.handlers.session_shutdown({}, india.ctx);
+  await juliet.handlers.session_shutdown({}, juliet.ctx);
   // Let any heartbeat callbacks already in flight finish before removing the
   // temporary state directory.
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
@@ -469,5 +662,15 @@ try {
 } finally {
   for (const link of madePeerLinks.reverse()) await rm(link, { recursive: true, force: true });
   if (madeModulesLink) await rm(localModules, { recursive: true, force: true });
-  await rm(stateDir, { recursive: true, force: true });
+  // A heartbeat write can land between the recursive walk and the rmdir, so
+  // retry instead of failing an otherwise passing run.
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      await rm(stateDir, { recursive: true, force: true });
+      break;
+    } catch (error) {
+      if (error?.code !== "ENOTEMPTY" || attempt === 5) throw error;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+    }
+  }
 }
