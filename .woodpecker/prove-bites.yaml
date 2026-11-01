@@ -1,0 +1,13 @@
+# A deliberately bad workflow, pushed once to prove the shared lint gate refuses it in CI. Reverted in the
+# next commit. Two of the traps it exists to catch, in one file: the v2 `when.paths:` spelling (upstream
+# docs still show it) and a `commands:` item containing ': ', which YAML parses as a mapping.
+steps:
+  - name: build
+    image: alpine
+    commands:
+      - grep -q 'FATAL: nope' /tmp/out
+when:
+  - event: push
+    paths:
+      include:
+        - 'src/**'
