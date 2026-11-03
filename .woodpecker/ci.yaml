@@ -1,0 +1,15 @@
+# The extension's own test suite: npm run test is test:core + test:network + test:history, which is
+# the gate the repo documents before reinstall.sh. Node 22 is what the repo's engines and the local
+# toolchain use.
+steps:
+  - name: test
+    image: docker.io/library/node:22-alpine
+    commands:
+      - node --version
+      - npm ci
+      - npm test
+
+when:
+  - event: push
+    branch: master
+  - event: pull_request
