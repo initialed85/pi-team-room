@@ -1,13 +1,33 @@
-# The extension's own test suite: npm run test is test:core + test:network + test:history, which is
-# the gate the repo documents before reinstall.sh. Node 22 is what the repo's engines and the local
-# toolchain use.
+# The extension's own test suite.
+#
+# npm run test is test:core + test:network + test:history, which is the gate the README requires before
+# reinstall.sh. The flags match reinstall.sh exactly (`npm ci --ignore-scripts --legacy-peer-deps`), so
+# the lane proves the same install the documented path performs.
+#
+# The extension is written against Pi's API and the harnesses load it through jiti, so they need a real
+# Pi install, not just this repo's dependencies. They find one by looking for a node_modules that
+# bundles jiti/lib/jiti.mjs, and a bare container has none, so the lane installs the package and points
+# PI_TEAM_ROOM_TEST_NODE_MODULES at it. That is deliberately the unpinned version: package.json declares
+# these as peerDependencies with "*", which means "any pi", and testing against the newest release is
+# what makes that promise mean something. It also means a breaking change upstream can turn this lane red
+# with no commit here - that is the intended behaviour, not flake, and the fix is the extension.
+#
+# Verified locally in the order the lane runs: npm ci rc=0, then npm test with all three harnesses
+# passing against a freshly installed pi.
 steps:
   - name: test
     image: docker.io/library/node:22-alpine
     commands:
       - node --version
-      - npm ci
-      - npm test
+      - npm --version
+      - npm ci --ignore-scripts --legacy-peer-deps
+      # --prefix keeps the probe install out of this repo's tree, so it cannot be mistaken for the
+      # extension's own dependencies or end up in a diff.
+      - mkdir -p /tmp/pi && printf '{"name":"ci-probe","private":true}\n' > /tmp/pi/package.json
+      - npm install --prefix /tmp/pi @earendil-works/pi-coding-agent --no-audit --no-fund
+      - test -f /tmp/pi/node_modules/jiti/lib/jiti.mjs && echo "pi bundles jiti, harnesses can load the extension"
+      - pwd
+      - PI_TEAM_ROOM_TEST_NODE_MODULES=/tmp/pi/node_modules npm test
 
 when:
   - event: push
