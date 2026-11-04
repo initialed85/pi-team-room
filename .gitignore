@@ -7,3 +7,26 @@ node_modules/
 .DS_Store
 .env
 .env.*
+
+# Chat history never belongs in this repository. The viewer indexes transcripts from
+# ~/.pi/agent/sessions at run time and every test writes its own room into a t.TempDir, so a
+# .jsonl under version control can only ever be someone's real conversation. **/state.json
+# above already covers a copy of the room state.
+*.jsonl
+
+# Output generated *from* the viewer, as opposed to the UI itself: a curl of the running
+# server, a saved DOM dump, a screenshot, a one-page export. The interface is the hand-written
+# template at viewer/ui/index.html, which go:embed compiles into the binary and which is
+# tracked. These rules deliberately do not reach into viewer/ui/.
+viewer/*.html
+viewer/*.dom.html
+viewer/*.render.html
+viewer/*.png
+viewer/*.jpg
+viewer/tmp/
+
+# Build and test artefacts. CI builds to /tmp for the same reason.
+/viewer/viewer
+/viewer/pi-team-viewer
+*.test
+coverage.*

@@ -1,0 +1,682 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pi team room · chat view</title>
+<style>
+:root{
+  --bg:#0b0d10; --bg2:#12151a; --bg3:#171b21; --line:#232831; --line2:#2c323d;
+  --fg:#e8ecf1; --dim:#98a2ad; --dim2:#6b7681; --accent:#5ad1c8; --accent2:#7aa2f7;
+  --warn:#f0b429; --bad:#ef6b6b; --good:#5ecb8e; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column}
+header.top{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--bg2);flex-wrap:wrap}
+.brand{font-weight:700;letter-spacing:.4px}
+.brand b{color:var(--accent)}
+.tabs{display:flex;gap:4px}
+.tabs button,select,input[type=search],.ctl{background:var(--bg3);color:var(--fg);border:1px solid var(--line2);border-radius:7px;padding:6px 10px;font:inherit;cursor:pointer}
+.tabs button.active{background:var(--accent);border-color:var(--accent);color:#06231f;font-weight:600}
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input[type=search]{cursor:text;min-width:220px}
+label.chk{display:flex;gap:5px;align-items:center;color:var(--dim);font-size:12.5px;cursor:pointer}
+.stats{margin-left:auto;color:var(--dim2);font-family:var(--mono);font-size:11.5px;display:flex;gap:12px;align-items:center}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--dim2);display:inline-block}
+.dot.on{background:var(--good);box-shadow:0 0 8px #5ecb8e66}
+button.live.on{border-color:var(--good);color:var(--good)}
+main{flex:1;display:grid;grid-template-columns:320px 1fr;min-height:0}
+aside.list{border-right:1px solid var(--line);background:var(--bg2);overflow:auto}
+.list .item{padding:9px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.list .item:hover{background:var(--bg3)}
+.list .item.active{background:var(--bg3);border-left:3px solid var(--accent)}
+.item .t1{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+.item .name{font-weight:600;font-size:13.5px}
+.item .when{color:var(--dim2);font-size:11px;font-family:var(--mono);white-space:nowrap}
+.item .sub{color:var(--dim);font-size:11.5px;margin-top:3px;font-family:var(--mono)}
+.item .badges{display:flex;gap:6px;margin-top:5px;flex-wrap:wrap}
+.badge{font-size:10.5px;font-family:var(--mono);padding:1px 6px;border-radius:20px;border:1px solid var(--line2);color:var(--dim)}
+.badge.warn{color:var(--warn);border-color:#f0b42955}
+.badge.bad{color:var(--bad);border-color:#ef6b6b55}
+.badge.good{color:var(--good);border-color:#5ecb8e55}
+.badge.info{color:var(--accent2);border-color:#7aa2f755}
+section.detail{overflow:auto;padding:0 0 40px}
+.detail-head{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);padding:10px 18px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;z-index:2}
+.detail-head h2{margin:0;font-size:15px}
+.detail-head .meta{color:var(--dim2);font-size:11.5px;font-family:var(--mono)}
+.empty{padding:40px;color:var(--dim2);text-align:center}
+.episode{margin:16px 18px 6px;color:var(--dim2);font-family:var(--mono);font-size:11px;display:flex;align-items:center;gap:10px}
+.episode:before,.episode:after{content:"";height:1px;background:var(--line);flex:1}
+.msg{display:flex;padding:5px 18px;gap:10px}
+.msg.rejected .bubble{border-style:dashed;background:#1a1416}
+.msg.rejected .kind{color:#e0736b}
+.repeat{margin-top:6px;padding:4px 8px;border:1px dashed #6a5a2a;border-radius:6px;background:#1d1a12;color:#e7c66b;font-size:12px}
+.alerts{padding:6px 18px;border-bottom:1px solid var(--line);background:#151a20;font-size:12.5px;color:#c8d3dc;display:none}
+.alerts b{color:#e7c66b}
+.alerts div{padding:2px 0}
+.msg.out{flex-direction:row-reverse}
+.avatar{width:26px;height:26px;border-radius:50%;flex:0 0 26px;display:grid;place-items:center;font-size:11px;font-weight:700;color:#06121f}
+.bubble{max-width:min(760px,72%);background:var(--bg3);border:1px solid var(--line2);border-left:3px solid var(--line2);border-radius:10px;padding:8px 11px}
+.msg.out .bubble{background:#18242c;border-left-color:transparent;border-right:3px solid var(--line2)}
+.who{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:11.5px;color:var(--dim2);font-family:var(--mono)}
+.who .actor{font-weight:700;color:var(--fg)}
+.kind{font-size:10px;text-transform:uppercase;letter-spacing:.6px;padding:1px 6px;border-radius:4px;border:1px solid var(--line2);color:var(--dim)}
+.kind.ask{color:var(--accent2);border-color:#7aa2f766}
+.kind.reply{color:var(--good);border-color:#5ecb8e66}
+.kind.delegate{color:var(--warn);border-color:#f0b42966}
+.kind.steer{color:#c58af9;border-color:#c58af966}
+.body{margin-top:5px;white-space:pre-wrap;word-break:break-word}
+.body code{font-family:var(--mono);font-size:12px;background:#0c1015;padding:1px 4px;border-radius:4px}
+.body a{color:var(--accent2)}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+.delegation{margin-top:7px;border:1px dashed #f0b42955;border-radius:8px;padding:7px 9px;font-size:12.5px;color:#e6d6ac}
+.delegation dl{margin:0;display:grid;grid-template-columns:120px 1fr;gap:3px 10px}
+.delegation dt{color:var(--dim2);font-family:var(--mono);font-size:11px}
+.delegation dd{margin:0;white-space:pre-wrap}
+.err{margin-top:6px;color:var(--bad);font-family:var(--mono);font-size:11.5px}
+.thread{margin-top:5px;font-size:11px;color:var(--dim2);font-family:var(--mono)}
+.detail.section-sessions .tl{padding:4px 18px}
+.tl{display:flex;gap:10px;padding:5px 18px;border-bottom:1px solid #1a1f26}
+.tl .mark{flex:0 0 92px;font-family:var(--mono);font-size:10.5px;color:var(--dim2);text-transform:uppercase;letter-spacing:.4px}
+.tl .card{flex:1;min-width:0}
+.tl.user .card{background:#18242c;border:1px solid var(--line2);border-radius:9px;padding:7px 10px}
+.tl.wake .card{background:#161f1b;border:1px solid #5ecb8e33;border-radius:9px;padding:7px 10px}
+.tl.team_room .card,.tl.tool_result.team .card{background:#141b26;border:1px solid #7aa2f733;border-radius:9px;padding:7px 10px}
+.tl.assistant .card{color:#cfd6de}
+.tl.tool .card,.tl.tool_result .card{color:var(--dim);font-family:var(--mono);font-size:11.5px}
+.tl.system .card,.tl.session .card,.tl.compaction .card{color:var(--dim2);font-family:var(--mono);font-size:11px}
+.mono{font-family:var(--mono);font-size:11.5px;color:var(--dim2)}
+.btnrow{display:flex;gap:8px;padding:12px 18px}
+button.load{background:var(--bg3);border:1px solid var(--line2);color:var(--dim);border-radius:7px;padding:7px 12px;font:inherit;cursor:pointer}
+.inspector{position:fixed;right:0;top:0;bottom:0;width:min(520px,45vw);background:var(--bg2);border-left:1px solid var(--line);overflow:auto;padding:14px;display:none}
+.inspector.open{display:block}
+.inspector h3{margin:0 0 10px;font-size:13px;display:flex;justify-content:space-between}
+.inspector table{width:100%;border-collapse:collapse;font-size:12px}
+.inspector th,.inspector td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+.inspector th{color:var(--dim2);font-family:var(--mono);font-size:11px;width:140px;font-weight:500}
+.inspector pre{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:11.5px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px}
+.inspector .close{cursor:pointer;color:var(--dim2)}
+.section-title{padding:12px 18px 4px;color:var(--dim2);font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.7px}
+a{color:var(--accent)}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">pi<b>·</b>team room</div>
+  <nav class="tabs">
+    <button data-mode="chats" class="active">Chats</button>
+    <button data-mode="sessions">Sessions</button>
+    <button data-mode="feed">Room feed</button>
+  </nav>
+  <div class="controls">
+    <input id="search" type="search" placeholder="search teammate messages…">
+    <select id="actor" class="ctl"><option value="">all agents</option></select>
+    <select id="window" class="ctl">
+      <option value="30">30 min gap</option>
+      <option value="90" selected>90 min gap</option>
+      <option value="360">6 h gap</option>
+      <option value="1440">24 h gap</option>
+    </select>
+    <label class="chk"><input type="checkbox" id="split"> split episodes</label>
+    <button id="live" class="ctl live on">live</button>
+  </div>
+  <div class="stats" id="stats"><span class="dot" id="dot"></span><span id="stattext">indexing…</span></div>
+  <div class="alerts" id="alerts"></div>
+</header>
+<main>
+  <aside class="list" id="list"></aside>
+  <section class="detail" id="detail"></section>
+</main>
+<div class="inspector" id="inspector"></div>
+<script>
+const S = {
+  mode: 'chats',
+  chats: [], sessions: [], openChat: null, openSession: null,
+  perspective: '', filters: { q: '', actor: '', window: 90, split: false },
+  live: true, generation: 0, timeline: [], offset: 0, total: 0, hasMore: false,
+  openAtBottom: true, messages: [], showRepeats: false,
+};
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function hue(name){
+  let h = 0;
+  for (const ch of String(name||'?')) h = (h * 31 + ch.codePointAt(0)) % 360;
+  return h;
+}
+function initials(name){
+  const parts = String(name||'?').replace(/[@_\-.]/g,' ').split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0]+parts[1][0]).toUpperCase();
+  return String(name||'?').slice(0,2).toUpperCase();
+}
+function colorOf(name){ return `hsl(${hue(name)} 62% 62%)`; }
+function ago(t){
+  if (!t) return '—';
+  const d = (Date.now() - new Date(t).getTime())/1000;
+  if (d < 60) return Math.max(0,Math.round(d))+'s ago';
+  if (d < 3600) return Math.round(d/60)+'m ago';
+  if (d < 86400) return Math.round(d/3600)+'h ago';
+  if (d < 86400*7) return Math.round(d/86400)+'d ago';
+  return new Date(t).toISOString().slice(0,10);
+}
+function clock(t){
+  if (!t) return '';
+  const d = new Date(t);
+  return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+function stamp(t){
+  if (!t) return '';
+  return new Date(t).toISOString().replace('T',' ').slice(0,19)+'Z';
+}
+function dur(ms){ return ms == null ? '' : (ms < 1000 ? Math.round(ms)+'ms' : (ms/1000).toFixed(2)+'s'); }
+// span floors, exactly like the server's own span text, so the same loop reads the same
+// length in the warning strip and on the bubble.
+function span(sec){
+  if (sec == null) return '';
+  if (sec < 60) return Math.floor(sec)+'s';
+  if (sec < 3600) return Math.floor(sec/60)+'m';
+  return Math.floor(sec/3600)+'h'+String(Math.floor(sec/60)%60).padStart(2,'0')+'m';
+}
+
+// md renders the small amount of markup teammates actually use, without trusting it.
+function md(text){
+  let out = esc(text || '');
+  out = out.replace(/```([\s\S]*?)```/g, (m, code) => `<code>${code.trim()}</code>`);
+  out = out.replace(/`([^`\n]{1,160})`/g, (m, code) => `<code>${code}</code>`);
+  out = out.replace(/\*\*([^*\n]{1,200})\*\*/g, (m, b) => `<strong>${b}</strong>`);
+  out = out.replace(/(https?:\/\/[^\s<)"']{6,})/g, (m, url) => `<a href="${url}" target="_blank" rel="noopener">${url}</a>`);
+  return out;
+}
+
+function rich(text, chars, truncated){
+  let body = md(text);
+  if (truncated) body += `\n<span class="mono">… ${chars} chars stored (truncated)</span>`;
+  return body;
+}
+
+async function api(path, params){
+  const url = new URL(path, location.origin);
+  for (const [k, v] of Object.entries(params || {})) if (v !== '' && v !== undefined && v !== null) url.searchParams.set(k, v);
+  const res = await fetch(url, {cache: 'no-store'});
+  if (!res.ok) throw new Error(`${res.status} ${path}`);
+  return res.json();
+}
+
+function query(extra){
+  const q = { mode: S.mode === 'sessions' ? 'sessions' : 'participants', actor: S.filters.actor, q: S.filters.q, window: S.filters.window };
+  if (S.filters.split) q.split = 1;
+  return Object.assign(q, extra || {});
+}
+
+async function loadChats(){
+  const data = await api('/api/chats', query());
+  S.chats = data.chats || [];
+  S.generation = data.generation;
+  renderStats(data.health, data.options);
+  renderAlerts(data.warnings);
+  fillActors(data.chats, data.health);
+  renderChatList();
+  if (S.openChat) {
+    if (!S.chats.find(c => c.id === S.openChat)) { S.openChat = null; renderDetailEmpty(); }
+    else await openChat(S.openChat, {keepScroll: true});
+  }
+}
+
+async function loadSessions(){
+  const data = await api('/api/sessions', query());
+  S.sessions = data.sessions || [];
+  S.generation = data.generation;
+  renderStats(data.health);
+  renderAlerts(data.warnings);
+  fillActorsFromSessions(S.sessions);
+  renderSessionList();
+  if (S.openSession) await openSession(S.openSession, {keepScroll: true});
+}
+
+async function loadFeed(){
+  const data = await api('/api/broadcast', {limit: 300, actor: S.filters.actor});
+  renderStats({});
+  renderFeed(data.broadcast || []);
+}
+
+function renderAlerts(list){
+  const host = $('alerts');
+  if (!list || !list.length) { host.style.display = 'none'; host.innerHTML = ''; return; }
+  host.style.display = 'block';
+  host.innerHTML = list.map(x => `<div>⚠ ${esc(x)}</div>`).join('');
+}
+
+function renderStats(h, options){
+  const parts = [];
+  if (h) {
+    parts.push(`${h.sessions} sessions`);
+    parts.push(`${h.directMessages||0} direct`);
+    parts.push(`${h.wakes||0} wakes`);
+    parts.push(`${h.threads||0} threads`);
+    if (h.rejectedSends) parts.push(`${h.rejectedSends} rejected by the room`);
+    if (h.repeatGroups) parts.push(`${h.repeatGroups} repeat loops (${h.repeatBubbles} bubbles)`);
+    if (h.unresolvedTargets) parts.push(`${h.unresolvedTargets} unresolved`);
+    if (h.inferredTargets) parts.push(`${h.inferredTargets} targets inferred`);
+    parts.push(`gen ${S.generation}`);
+  }
+  $('stattext').textContent = parts.join(' · ');
+  $('dot').className = 'dot' + (S.live ? ' on' : '');
+}
+
+function fillActors(chats){
+  const set = new Set();
+  for (const c of chats || []) for (const a of c.actors || []) set.add(a);
+  paintActorSelect(set);
+}
+function fillActorsFromSessions(sessions){
+  const set = new Set();
+  for (const s of sessions || []) if (s.label) set.add(s.label);
+  paintActorSelect(set);
+}
+function paintActorSelect(set){
+  const sel = $('actor');
+  const keep = S.filters.actor;
+  const current = new Set([...sel.options].map(o => o.value).filter(Boolean));
+  for (const a of set) current.add(a);
+  const sorted = [...current].sort();
+  sel.innerHTML = '<option value="">all agents</option>' + sorted.map(a => `<option value="${esc(a)}"${a===keep?' selected':''}>${esc(a)}</option>`).join('');
+}
+
+function badges(c){
+  const out = [];
+  out.push(`<span class="badge">${c.messages} msgs</span>`);
+  if (c.asks) out.push(`<span class="badge info">${c.asks} asks</span>`);
+  if (c.replies) out.push(`<span class="badge good">${c.replies} replies</span>`);
+  if (c.delegations) out.push(`<span class="badge warn">${c.delegations} delegations</span>`);
+  if (c.steers) out.push(`<span class="badge info">${c.steers} steers</span>`);
+  if (c.unanswered) out.push(`<span class="badge warn">${c.unanswered} unanswered</span>`);
+  if (c.pending) out.push(`<span class="badge warn">no delivery record</span>`);
+  if (c.unresolvedSends) out.push(`<span class="badge bad">${c.unresolvedSends} no peer</span>`);
+  if (c.selfLoops) out.push(`<span class="badge bad">${c.selfLoops} self</span>`);
+  if (c.rejected) out.push(`<span class="badge bad">${c.rejected} rejected</span>`);
+  if (c.maxRepeat > 1) out.push(`<span class="badge bad">×${c.maxRepeat} identical send</span>`);
+  if (c.badReplyRefs) out.push(`<span class="badge bad">${c.badReplyRefs} broken reply link${c.badReplyRefs>1?'s':''}</span>`);
+  if (c.maxWakesOnOneMessage > 1) out.push(`<span class="badge warn">×${c.maxWakesOnOneMessage} wake</span>`);
+  if (c.episodes > 1) out.push(`<span class="badge">${c.episodes} episodes</span>`);
+  return out.join('');
+}
+
+function renderChatList(){
+  const list = $('list');
+  if (!S.chats.length) { list.innerHTML = '<div class="empty">No teammate messages match the filters.</div>'; return; }
+  list.innerHTML = S.chats.map(c => `
+    <div class="item${c.id===S.openChat?' active':''}" data-id="${esc(c.id)}">
+      <div class="t1"><span class="name" style="color:${colorOf(c.actors[0])}">${esc(c.label)}</span><span class="when">${ago(c.lastAt)}</span></div>
+      <div class="sub">${esc(stamp(c.firstAt).slice(0,10))} → ${esc(clock(c.lastAt))} · ${c.distinct} agents</div>
+      <div class="badges">${badges(c)}</div>
+    </div>`).join('');
+  list.querySelectorAll('.item').forEach(el => el.onclick = () => openChat(el.dataset.id));
+}
+
+function renderSessionList(){
+  const list = $('list');
+  if (!S.sessions.length) { list.innerHTML = '<div class="empty">No sessions indexed.</div>'; return; }
+  list.innerHTML = S.sessions.map(s => {
+    const badges = [];
+    badges.push(`<span class="badge">${s.entries} entries</span>`);
+    if (s.teamRoomCalls) badges.push(`<span class="badge info">${s.teamRoomCalls} team_room</span>`);
+    if (s.wakes) badges.push(`<span class="badge good">${s.wakes} wakes</span>`);
+    if (s.connected) badges.push(`<span class="badge good">connected</span>`);
+    if (s.status) badges.push(`<span class="badge ${s.status==='working'?'info':''}">${esc(s.status)}</span>`);
+    if (s.roomOnly) badges.push(`<span class="badge bad">room record only</span>`);
+    return `
+    <div class="item${s.id===S.openSession?' active':''}" data-id="${esc(s.id)}">
+      <div class="t1"><span class="name" style="color:${colorOf(s.label)}">${esc(s.label)}</span><span class="when">${ago(s.lastSeen||s.lastAt)}</span></div>
+      <div class="sub">${esc(s.project||'?')} · ${esc(s.shortId)}${s.host?' · '+esc(s.host):''}</div>
+      <div class="sub">${esc(s.focus || s.preview || '').slice(0,110)}</div>
+      <div class="badges">${badges.join('')}</div>
+    </div>`;
+  }).join('');
+  list.querySelectorAll('.item').forEach(el => el.onclick = () => openSession(el.dataset.id));
+}
+
+function renderDetailEmpty(){
+  $('detail').className = 'detail';
+  $('detail').innerHTML = '<div class="empty">Pick a chat on the left.</div>';
+}
+
+function perspectiveFor(chat, messages){
+  const counts = {};
+  for (const m of messages) counts[m.fromActor] = (counts[m.fromActor]||0)+1;
+  const ranked = Object.entries(counts).sort((a,b)=>b[1]-a[1]);
+  return ranked[0] ? ranked[0][0] : (chat.actors[0] || '');
+}
+
+// The URL carries the view so a conversation is linkable from a terminal or a chat
+// message, and live can be switched off for a static render.
+function setUrl(extra){
+  const q = new URLSearchParams();
+  if (S.mode !== 'chats') q.set('mode', S.mode);
+  if (S.filters.q) q.set('q', S.filters.q);
+  if (S.filters.actor) q.set('actor', S.filters.actor);
+  if (!S.live) q.set('live', '0');
+  for (const [k, v] of Object.entries(extra || {})) { if (v != null && v !== '') q.set(k, v); }
+  const qs = q.toString();
+  history.replaceState(null, '', qs ? `?${qs}` : location.pathname);
+}
+
+async function openChat(id, opts){
+  opts = opts || {};
+  S.openChat = id; S.openSession = null;
+  setUrl({chat: id});
+  renderChatList();
+  const data = await api('/api/chat', query({id}));
+  const chat = data.chat, msgs = data.messages || [];
+  const persp = S.perspective && chat.actors.includes(S.perspective) ? S.perspective : perspectiveFor(chat, msgs);
+  const scroller = $('detail');
+  const prevTop = scroller.scrollTop, atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 120;
+  $('detail').className = 'detail section-chat';
+  $('detail').innerHTML = `
+    <div class="detail-head">
+      <h2 style="color:${colorOf(chat.actors[0])}">${esc(chat.label)}</h2>
+      <span class="meta">${esc(stamp(chat.firstAt))} → ${esc(stamp(chat.lastAt))} · ${chat.messages} messages${chat.episodes>1?` · ${chat.episodes} episodes`:''}</span>
+      <select class="ctl" id="persp">
+        ${chat.actors.map(a=>`<option value="${esc(a)}"${a===persp?' selected':''}>perspective: ${esc(a)}</option>`).join('')}
+      </select>
+      <label class="chk"><input type="checkbox" id="showrep"${S.showRepeats?' checked':''}> show every repeated send</label>
+      <span class="meta" id="chatflags">${chatflags(chat)}</span>
+    </div>
+    <div id="thread"></div>`;
+  $('persp').onchange = (e) => { S.perspective = e.target.value; openChat(id); };
+  $('showrep').onchange = (e) => { S.showRepeats = e.target.checked; openChat(id); };
+  paintMessages(msgs, persp);
+  if (opts.keepScroll && atBottom) scroller.scrollTop = scroller.scrollHeight;
+  else if (!opts.keepScroll) scroller.scrollTop = scroller.scrollHeight;
+}
+
+function chatflags(chat){
+  const f = [];
+  if (chat.unanswered) f.push(`${chat.unanswered} unanswered`);
+  if (chat.pending) f.push(`${chat.pending} with no delivery record`);
+  if (chat.unresolvedSends) f.push(`${chat.unresolvedSends} unresolved target`);
+  if (chat.selfLoops) f.push(`${chat.selfLoops} self-directed`);
+  if (chat.rejected) f.push(`${chat.rejected} rejected by the room`);
+  if (chat.badReplyRefs) f.push(`${chat.badReplyRefs} broken reply links`);
+  if (chat.maxRepeat > 1) f.push(`one text sent ${chat.maxRepeat}×`);
+  if (!f.length) f.push('clean');
+  return f.join(' · ');
+}
+
+function paintMessages(msgs, persp){
+  const host = $('thread');
+  let html = '', lastEpisode = null;
+  for (const m of msgs) {
+    if (m.episode && m.episode !== lastEpisode) {
+      html += `<div class="episode">episode ${m.episode} · ${esc(stamp(m.sentAt))}</div>`;
+      lastEpisode = m.episode;
+    }
+    // A repeat group is one loop, not N messages: show the first and say how many
+    // identical sends the loop actually contains.
+    if (m.repeatIndex > 1 && !S.showRepeats) continue;
+    html += bubble(m, persp);
+  }
+  host.innerHTML = html;
+  host.querySelectorAll('.msg').forEach(el => el.onclick = () => inspect(el.dataset.id, msgs));
+}
+
+function chips(m){
+  const out = [];
+  if (m.deliveryUsed) {
+    const auto = m.deliveryAuto ? ' (auto)' : '';
+    const req = m.deliveryRequested && m.deliveryRequested !== m.deliveryUsed ? `${m.deliveryRequested}→${m.deliveryUsed}` : m.deliveryUsed;
+    out.push(`<span class="badge info">delivery ${esc(req)}${auto}</span>`);
+  } else if (m.wakeDelivery) {
+    out.push(`<span class="badge info">delivery ${esc(m.wakeDelivery)}</span>`);
+  }
+  if (m.recipientStatus) out.push(`<span class="badge">peer ${esc(m.recipientStatus)}</span>`);
+  if (m.deliveredAt) out.push(`<span class="badge good">delivered ${esc(clock(m.deliveredAt))}</span>`);
+  else out.push(`<span class="badge warn">not delivered</span>`);
+  if (m.readAt) out.push(`<span class="badge good">read ${esc(clock(m.readAt))}</span>`);
+  if (m.kind === 'ask' || m.kind === 'delegate') {
+    if (m.answered) out.push(`<span class="badge good">answered${m.answeredBy?.length?' by '+esc(m.answeredBy.join(', ')):''}</span>`);
+    else out.push(`<span class="badge warn">no answer</span>`);
+  }
+  if (m.rejected) out.push(`<span class="badge bad">the room rejected this call</span>`);
+  if (m.repeatCount > 1) out.push(`<span class="badge bad">identical send ${m.repeatIndex} of ${m.repeatCount}</span>`);
+  if (m.wakeCount > 1) out.push(`<span class="badge warn">woke peer ${m.wakeCount}×</span>`);
+  if (m.selfLoop) out.push(`<span class="badge bad">looped back to sender</span>`);
+  if (m.unresolvedTarget) out.push(`<span class="badge bad">target did not resolve</span>`);
+  if (m.targetInferred) out.push(`<span class="badge warn">target inferred from the wake that prompted it</span>`);
+  if (m.badReplyReason) out.push(`<span class="badge bad">messageId ${esc(m.badReplyReason)}</span>`);
+  if (m.durationMs) out.push(`<span class="badge">call ${esc(dur(m.durationMs))}</span>`);
+  if (m.sources) out.push(`<span class="badge">seen in: ${esc(m.sources.join(' + '))}</span>`);
+  return out.join('');
+}
+
+function bubble(m, persp){
+  const out = m.fromActor === persp;
+  const kindClass = ['ask','reply','delegate','steer'].includes(m.kind) ? m.kind : '';
+  const target = m.toActor ? `<span class="mono">→ ${esc(m.toActor)}</span>` : '<span class="mono">→ ?</span>';
+  const del = m.delegation ? `
+    <div class="delegation"><dl>
+      ${m.delegation.target?`<dt>target</dt><dd>${esc(m.delegation.target)}</dd>`:''}
+      ${m.delegation.scope?`<dt>scope</dt><dd>${md(m.delegation.scope)}</dd>`:''}
+      ${m.delegation.userAuthorization?`<dt>user authorization</dt><dd>${md(m.delegation.userAuthorization)}</dd>`:''}
+      ${m.delegation.acceptanceChecks?`<dt>acceptance checks</dt><dd>${md(m.delegation.acceptanceChecks)}</dd>`:''}
+      ${m.delegation.expectedArtifact?`<dt>expected artifact</dt><dd>${md(m.delegation.expectedArtifact)}</dd>`:''}
+    </dl></div>` : '';
+  const reply = m.replyTo ? `<div class="thread">↩ replies to ${esc(String(m.replyTo).slice(0,8))}${m.linkedReply?'':' (link not resolved)'}${m.badReplyReason?` — ${esc(m.badReplyReason)}`:''}</div>` : '';
+  const err = m.errorText ? `<div class="err">✕ ${esc(m.errorText)}</div>` : '';
+  const repeat = m.repeatCount > 1 ? `<div class="repeat">↻ ${esc(m.fromActor)} sent this exact ${esc(m.kind)} ${m.repeatCount} times in ${esc(span(m.repeatSpanSeconds))}${m.repeatRejected ? ` — the room rejected ${m.repeatRejected} of them` : ''}${S.showRepeats?'':' — the other '+(m.repeatCount-1)+' are hidden'}</div>` : '';
+  return `
+  <div class="msg ${out?'out':'in'}${m.rejected?' rejected':''}" data-id="${esc(m.id)}">
+    <div class="avatar" style="background:${colorOf(m.fromActor)}">${esc(initials(m.fromActor))}</div>
+    <div class="bubble" style="${out?'border-right-color:'+colorOf(m.fromActor):'border-left-color:'+colorOf(m.fromActor)}">
+      <div class="who">
+        <span class="actor" style="color:${colorOf(m.fromActor)}">${esc(m.fromActor||'?')}</span>${target}
+        <span class="kind ${kindClass}">${esc(m.kind)}</span>
+        <span>${esc(clock(m.sentAt))}</span>
+        ${m.shortId?`<span class="mono">#${esc(m.shortId)}</span>`:''}
+      </div>
+      <div class="body">${rich(m.text, m.textChars, m.truncated)}</div>
+      ${del}${reply}${err}${repeat}
+      <div class="chips">${chips(m)}</div>
+    </div>
+  </div>`;
+}
+
+async function openSession(id, opts){
+  opts = opts || {};
+  S.openSession = id; S.openChat = null;
+  setUrl({session: id});
+  renderSessionList();
+  const limit = 200;
+  const data = await api('/api/session', {id, limit, offset: opts.offset || 0, only: opts.only || ''});
+  S.timeline = data.timeline || []; S.offset = data.offset; S.total = data.total; S.hasMore = data.hasMore;
+  const s = data.summary || data.session || {};
+  const scroller = $('detail');
+  const atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 120;
+  $('detail').className = 'detail section-sessions';
+  $('detail').innerHTML = `
+    <div class="detail-head">
+      <h2 style="color:${colorOf(s.label||s.id)}">${esc(s.label||s.id)}</h2>
+      <span class="meta">${esc(s.project||'?')} · session ${esc(s.shortId||'')} · ${esc(stamp(s.lastSeen||s.lastAt))}</span>
+      <span class="meta">${s.entries||0} entries · ${s.teamRoomCalls||0} team_room · ${s.wakes||0} wakes${s.status?' · '+esc(s.status):''}${s.connected?' · connected':''}</span>
+      <select class="ctl" id="tlfilter">
+        <option value="">everything</option>
+        <option value="team"${opts.only==='team'?' selected':''}>team-room traffic + prompts</option>
+      </select>
+    </div>
+    ${s.focus?`<div class="section-title">focus: ${esc(s.focus)}</div>`:''}
+    ${s.checkpoint?`<div class="section-title">checkpoint: ${esc(s.checkpoint)}</div>`:''}
+    <div class="btnrow"><button class="load" id="older">load older (${S.total - S.timeline.length} older of ${S.total})</button></div>
+    <div id="tl"></div>
+    <div class="mono" style="padding:10px 18px">${esc(s.file||'')}</div>`;
+  $('older').onclick = () => openSession(id, {offset: S.offset + limit, only: $('tlfilter').value});
+  $('tlfilter').onchange = (e) => openSession(id, {only: e.target.value});
+  paintTimeline(S.timeline);
+  if (opts.keepScroll && atBottom) scroller.scrollTop = scroller.scrollHeight;
+  else scroller.scrollTop = 0;
+}
+
+function paintTimeline(items){
+  const host = $('tl');
+  host.innerHTML = items.map(it => {
+    const cls = [it.kind];
+    if (it.teamRoom || (it.tool === 'team_room')) cls.push('team_room');
+    if (it.tool === 'team_room' && it.kind === 'tool_result') cls.push('team');
+    const mark = it.kind === 'tool_result' ? (it.tool||'result') : it.kind;
+    let body = '';
+    if (it.teamRoom && it.kind !== 'tool_result') {
+      body = `<div class="who"><span class="kind ${it.teamRoom.action==='reply'?'reply':(it.teamRoom.action==='ask'?'ask':'')}">${esc(it.teamRoom.action||'')}</span>${it.teamRoom.agent?`<span class="mono">→ ${esc(it.teamRoom.agent)}</span>`:''}<span>${esc(clock(it.at))}</span></div>
+        <div class="body">${rich(it.teamRoom.text, it.chars, false)}</div>`;
+    } else if (it.kind === 'tool_result' && it.teamRoom) {
+      body = `<div class="who"><span class="mono">confirm</span><span>${esc(clock(it.at))}</span></div><div class="body">${md(it.text||it.preview||'')}</div>`;
+    } else if (it.kind === 'wake') {
+      const froms = (it.wake?.from||[]).map(f=>`<span class="mono">← ${esc(f)}</span>`).join(' ');
+      body = `<div class="who"><span class="kind reply">wake</span>${froms}<span class="mono">${esc(it.wake?.delivery||'')}</span><span>${esc(clock(it.at))}</span></div><div class="body">${rich(it.text, it.chars, false)}</div>`;
+    } else if (it.kind === 'user') {
+      body = `<div class="who"><span class="actor">user</span><span>${esc(clock(it.at))}</span></div><div class="body">${rich(it.text, it.chars, false)}</div>`;
+    } else if (it.kind === 'assistant') {
+      body = `<div class="who"><span class="actor" style="color:${colorOf('assistant')}">assistant</span>${it.model?`<span class="mono">${esc(it.model)}</span>`:''}<span>${esc(clock(it.at))}</span></div>
+        ${it.thinking?`<div class="mono">thinking: ${esc(it.thinking.slice(0,300))}</div>`:''}
+        <div class="body">${rich(it.text, it.chars, false)}</div>`;
+    } else if (it.kind === 'tool' || it.kind === 'tool_result') {
+      body = `<div class="who"><span class="mono">${esc(it.tool||'')}</span>${it.isError?'<span class="badge bad">error</span>':''}${it.durationMs?`<span class="mono">${esc(dur(it.durationMs))}</span>`:''}<span>${esc(clock(it.at))}</span></div>
+        <div class="mono">${esc(it.preview || it.text || '')}</div>`;
+    } else {
+      body = `<div class="mono">${esc(it.name||it.summary||it.text||'')}</div>`;
+    }
+    return `<div class="tl ${cls.join(' ')}"><div class="mark">${esc(mark)}</div><div class="card">${body}</div></div>`;
+  }).join('');
+}
+
+function renderFeed(items){
+  $('detail').className = 'detail section-feed';
+  $('detail').innerHTML = `
+    <div class="detail-head"><h2>Room feed</h2><span class="meta">room-level calls: pulse, inbox, update, checkpoint, history</span>
+      <select class="ctl" id="feedkind"><option value="">all kinds</option>${['pulse','inbox','update','checkpoint','remember','history','focus'].map(k=>`<option value="${k}">${k}</option>`).join('')}</select>
+    </div><div id="feed"></div>`;
+  const paint = (list) => {
+    $('feed').innerHTML = list.map(m => `
+      <div class="tl ${m.kind==='update'?'team_room':'system'}"><div class="mark">${esc(m.kind)}</div><div class="card">
+        <div class="who"><span class="actor" style="color:${colorOf(m.fromActor)}">${esc(m.fromActor)}</span><span>${esc(clock(m.sentAt))}</span><span class="mono">${ago(m.sentAt)}</span></div>
+        <div class="body">${rich(m.text, m.textChars, m.truncated)}</div>
+      </div></div>`).join('') || '<div class="empty">Nothing in the feed.</div>';
+  };
+  paint(items);
+  $('feedkind').onchange = async (e) => {
+    const data = await api('/api/broadcast', {limit: 300, actor: S.filters.actor, kind: e.target.value});
+    paint(data.broadcast || []);
+  };
+}
+
+function inspect(id, msgs){
+  const m = msgs.find(x => x.id === id);
+  if (!m) return;
+  const row = (k, v) => v === undefined || v === null || v === '' ? '' : `<tr><th>${esc(k)}</th><td>${typeof v === 'string' ? md(v) : esc(JSON.stringify(v))}</td></tr>`;
+  $('inspector').className = 'inspector open';
+  $('inspector').innerHTML = `
+    <h3>message <span class="close" id="close">close ✕</span></h3>
+    <table>
+      ${row('kind', m.kind)}
+      ${row('from', `${m.fromActor} (${m.fromSession||'no session id'})`)}
+      ${row('to', `${m.toActor||'?'} ${m.toSession?'('+m.toSession+')':''}`)}
+      ${row('sent', stamp(m.sentAt))}
+      ${row('delivered', stamp(m.deliveredAt) || 'never')}
+      ${row('read', stamp(m.readAt) || 'no receipt')}
+      ${row('delivery requested', m.deliveryRequested)}
+      ${row('delivery used', m.deliveryUsed + (m.deliveryAuto ? ' (chosen by the room)' : ''))}
+      ${row('wake delivery', m.wakeDelivery)}
+      ${row('woken sessions', (m.wokenBy||[]).join(', '))}
+      ${row('wake count', m.wakeCount)}
+      ${row('answered', m.answered ? 'yes' + (m.answeredBy?.length? ' by '+m.answeredBy.join(', '):'') : 'no')}
+      ${row('thread', m.threadId)}
+      ${row('episode', m.episode)}
+      ${row('reply to', m.replyTo)}
+      ${row('message id', m.id)}
+      ${row('short id', m.shortId)}
+      ${row('call entry', m.callEntry)}
+      ${row('wake entry', m.wakeEntry)}
+      ${row('call duration', dur(m.durationMs))}
+      ${row('error', m.error ? (m.errorText || 'yes') : '')}
+      ${row('sources', (m.sources||[]).join(' + '))}
+      ${row('text chars', m.textChars)}
+    </table>
+    ${m.confirmation?`<div class="section-title">tool result (confirmation)</div><pre>${esc(m.confirmation)}</pre>`:''}
+    <div class="section-title">full text</div><pre>${esc(m.text)}</pre>
+    <div class="btnrow">
+      ${m.fromSession?`<button class="load" data-s="${esc(m.fromSession)}">open sender session timeline</button>`:''}
+      ${m.toSession?`<button class="load" data-s="${esc(m.toSession)}">open recipient session timeline</button>`:''}
+    </div>`;
+  $('close').onclick = () => { $('inspector').className = 'inspector'; };
+  $('inspector').querySelectorAll('button[data-s]').forEach(b => b.onclick = () => { setMode('sessions'); openSession(b.dataset.s); });
+}
+
+function setMode(mode){
+  S.mode = mode;
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+  renderDetailEmpty();
+  if (mode === 'chats') loadChats();
+  else if (mode === 'sessions') loadSessions();
+  else loadFeed();
+}
+
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => setMode(b.dataset.mode));
+$('search').oninput = debounce(() => { S.filters.q = $('search').value.trim(); refresh(); }, 250);
+$('actor').onchange = () => { S.filters.actor = $('actor').value; refresh(); };
+$('window').onchange = () => { S.filters.window = $('window').value; refresh(); };
+$('split').onchange = () => { S.filters.split = $('split').checked; refresh(); };
+$('live').onclick = () => { S.live = !S.live; $('live').className = 'ctl live' + (S.live ? ' on' : ''); renderStats({}); connect(); };
+
+function debounce(fn, ms){ let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+
+function refresh(){
+  if (S.mode === 'chats') loadChats();
+  else if (S.mode === 'sessions') loadSessions();
+  else loadFeed();
+}
+
+let es = null, retry = 0;
+function connect(){
+  if (es) { es.close(); es = null; }
+  if (!S.live) { renderStats({}); return; }
+  es = new EventSource('/api/events');
+  es.onmessage = (e) => { /* named events do not fire onmessage */ };
+  es.addEventListener('update', (e) => {
+    retry = 0;
+    try {
+      const payload = JSON.parse(e.data);
+      S.generation = payload.generation;
+      renderStats(payload.health);
+      renderAlerts(payload.warnings);
+      refresh();
+    } catch (err) { /* ignore malformed frame */ }
+  });
+  es.onerror = () => {
+    if (es) { es.close(); es = null; }
+    if (!S.live) return;
+    retry = Math.min(30, retry + 1);
+    setTimeout(connect, retry * 1000);
+  };
+}
+
+{
+  const params = new URLSearchParams(location.search);
+  if (params.get('mode')) S.mode = params.get('mode');
+  if (params.get('q')) { S.filters.q = params.get('q'); $('search').value = S.filters.q; }
+  if (params.get('actor')) S.filters.actor = params.get('actor');
+  if (params.get('window')) S.filters.window = Number(params.get('window')) || 90;
+  if (params.get('split') === '1') { S.filters.split = true; $('split').checked = true; }
+  if (params.get('live') === '0') { S.live = false; $('live').className = 'ctl live'; $('live').textContent = 'live off'; }
+  for (const b of document.querySelectorAll('.chip')) {
+    const on = (b.dataset.window && Number(b.dataset.window) === S.filters.window) ||
+               (b.dataset.split === '1' && S.filters.split) ||
+               (b.dataset.actor === 'all' && !S.filters.actor);
+    if (on) b.className = 'chip on';
+  }
+  // setMode loads the list, and loadChats/loadSessions reopen a deep-linked view.
+  S.openChat = params.get('chat') || null;
+  S.openSession = params.get('session') || null;
+  setMode(S.mode);
+  connect();
+}
+</script>
+</body>
+</html>

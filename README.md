@@ -147,6 +147,18 @@ Set `PI_SESSION_HISTORY=0` to disable automatic sidecar maintenance. `PI_SESSION
 
 The sidecar contains the complete persisted Pi session, including tool calls and results. It does not attempt to store every token-level streaming delta or provider HTTP payload; use `pi --mode json` when that lower-level event stream is what you need. Since Pi's JSONL retains branches and compaction metadata, the DB preserves those records rather than silently reducing a session to only the current LLM context.
 
+## Chat viewer
+
+`viewer/` is a local Go chat client for what the room actually did. It merges the session transcripts with `state.json` and renders them as conversations, so agent-to-agent behaviour can be read instead of grepped:
+
+```bash
+cd viewer && go run . --addr 127.0.0.1:18787
+```
+
+It exists because the room's failures are invisible in a transcript. A refused call writes a sentence and leaves `isError` false, so the agent treats it as success and moves on; and one send is written across two files plus the state ring, which never shows up as one event in either log. The viewer puts both sides in one bubble, labels its provenance, and reports the anomalies along the top: identical sends repeated, replies quoting an id that never existed, targets it had to infer, and messages only visible from one side because the ring aged out. `viewer/README.md` covers the flags and what each diagnostic means. It is read-only and it writes nothing.
+
+Its tests are hermetic, which is what lets `.woodpecker/viewer.yaml` run them without any transcript in the repo: each test builds its own room in a `t.TempDir`. One of them is a contract with this extension, so a new refusal sentence in `extension.ts` has to be recognised by the viewer or the lane goes red. Transcripts and rendered output are gitignored.
+
 ## Auto checkpoints
 
 When a session shuts down, if it was meaningfully active but never saved an explicit `checkpoint`, the extension leaves an automatic breadcrumb derived from its focus/latest prompt and prefixed `[auto]`. This means even a forgotten session leaves a resume point for teammates — but only as a fallback: explicit checkpoints always win, and sessions that have not been active for at least `PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS` create nothing.

@@ -1,0 +1,65 @@
+# The Go viewer under ./viewer, on the same principle as the extension lane: no network, no
+# infrastructure, nothing outside this repository.
+#
+# Why a second file instead of another step in ci.yaml. ci.yaml is the extension's lane and it needs a
+# real Pi install (npm ci, then a probe install of @earendil-works/pi-coding-agent) because the harnesses
+# load extension.ts through jiti. The viewer needs none of that. viewer/go.mod declares no dependencies
+# at all - `go list -deps` is stdlib plus the package itself - so the lane compiles against the golang
+# image and finishes in seconds. Splitting them also means a Go compile failure cannot be mistaken for an
+# extension failure on the badge, and the path filter below stops either lane running for a commit that
+# only touched the other.
+#
+# Why extension.ts is in the include list, although this lane never builds it. One viewer test is a
+# contract with the room's own wording. It reads ../extension.ts, extracts every sentence the room can
+# return or throw, and fails if the viewer does not classify all of them. The room refuses a call in
+# prose and leaves isError false, so a sentence the viewer does not know is rendered as a send that
+# worked. That contract is only worth having if editing the extension runs it, which is also why the step
+# below refuses to accept a skipped one.
+#
+# Why no transcript is checked in, and none is needed. Every test writes its own room into a t.TempDir -
+# two sessions, batch and single wakes, a delegation, a self-addressed reply, a peer that does not exist,
+# and a send the room forgot to record - so the lane is hermetic and does not depend on how much history
+# a developer's machine happens to keep. Real ~/.pi/agent/sessions files are chat history and have no
+# business in a repository. GOPROXY=off turns "these tests need nothing from outside the tree" from an
+# intention into an assertion, and it is why there is no module cache volume to mount.
+
+steps:
+  - name: test
+    image: docker.io/library/golang:1.26
+    environment:
+      GOPROXY: "off"
+      # viewer/go.mod declares go 1.23, so the image's own toolchain is newer than required and there is
+      # nothing to download. Pinned local so a stray `toolchain` line cannot make the lane fetch one.
+      GOTOOLCHAIN: local
+    commands:
+      - go version
+      - cd viewer
+      - test -z "$(gofmt -l .)" || { gofmt -l .; echo "FATAL gofmt - run gofmt -w on ./viewer and commit the result"; exit 1; }
+      - go vet ./...
+      # Built to /tmp, not into the tree: `go build ./.` for a main package drops a binary named
+      # `viewer` next to the sources, which is exactly the sort of artifact a CI run should not leave
+      # lying around where a later `git add -A` could pick it up.
+      - go build -o /tmp/pi-team-viewer-ci ./...
+      - test -x /tmp/pi-team-viewer-ci
+      # -count=1 because a cached pass of a test that reads its parent directory is not evidence.
+      - go test -count=1 ./...
+      # The two tests that guard the room's behaviour rather than the viewer's arithmetic, run again so
+      # their names appear in the log. Both skip themselves when their input is missing (the extension
+      # source, or a working HTTP view), and in a log a skip looks exactly like a pass. Two PASS lines.
+      - go test -count=1 -v -run 'TestVocabularyCoversTheRoomsOwnSentences|TestEveryViewReportsTheSameTranscripts' ./... 2>&1 | tee /tmp/contracts.log
+      - test "$(grep -c -- '--- PASS' /tmp/contracts.log)" = 2 || { cat /tmp/contracts.log; echo "FATAL the contract tests did not both pass"; exit 1; }
+
+when:
+  - event: push
+    branch: master
+    path:
+      include:
+        - 'viewer/**'
+        - 'extension.ts'
+        - '.woodpecker/viewer.yaml'
+  - event: pull_request
+    path:
+      include:
+        - 'viewer/**'
+        - 'extension.ts'
+        - '.woodpecker/viewer.yaml'
