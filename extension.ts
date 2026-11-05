@@ -216,6 +216,19 @@ function confirmationPreview(text: string): string {
   return preview.length === text.length ? preview : `${preview} … (${text.length} characters sent in full)`;
 }
 
+// File paths a prompt mentioned, kept on the session record so teammates can
+// see what a peer is working on without reading its transcript. The field
+// already existed on the record; nothing was ever filling it.
+function mentionedPaths(text: string | undefined): string[] {
+  if (!text) return [];
+  const paths = new Set<string>();
+  for (const match of text.matchAll(/\/[-\w.]+(?:\/[-\w.]+)+/g)) {
+    paths.add(match[0].replace(/[.,;:]+$/, ""));
+    if (paths.size >= 8) break;
+  }
+  return [...paths];
+}
+
 function projectLabel(project: string): string {
   const home = process.env.HOME;
   if (home && (project === home || project.startsWith(`${home}/`))) return `~${project.slice(home.length)}`;
@@ -266,6 +279,41 @@ async function loadState(): Promise<TeamRoomState> {
   } catch {
     return emptyState();
   }
+}
+
+// Cheap read for the paths that only display or search the room.
+//
+// The shared file changes underneath a session: the network service merges
+// peer snapshots every few seconds, and every Pi process on the node writes
+// its own record. So the cache is validated by identity (inode, size, mtime)
+// rather than trusted blindly - a stat is microseconds, while reading, parsing
+// and re-serializing a 150 KB state file costs a millisecond, and a bloated one
+// costs several. Read-only callers get the stat; anything about to write still
+// reads the file under the lock.
+//
+// The returned object is shared between callers and must be treated as
+// read-only.
+let readCache: { identity: string; state: TeamRoomState } | undefined;
+
+function fileIdentity(info: { ino: number; size: number; mtimeMs: number }): string {
+  return `${info.ino}:${info.size}:${info.mtimeMs}`;
+}
+
+async function readState(): Promise<TeamRoomState> {
+  const path = statePath();
+  try {
+    const info = await stat(path);
+    if (readCache && readCache.identity === fileIdentity(info)) return readCache.state;
+  } catch {
+    // No file yet, or it vanished mid-call: fall through to a plain load.
+  }
+  const state = await loadState();
+  try {
+    readCache = { identity: fileIdentity(await stat(path)), state };
+  } catch {
+    readCache = undefined;
+  }
+  return state;
 }
 
 async function saveState(state: TeamRoomState): Promise<void> {
@@ -697,10 +745,55 @@ export default function (pi: ExtensionAPI) {
   let restoreRegularOverlayPatch: (() => void) | undefined;
   let summaryOverlayData: { state: TeamRoomState; session: WorkSession } | undefined;
 
-  async function ensureSession(ctx: ContextLike, status: SessionStatus = "idle"): Promise<WorkSession> {
+  // One writer for this process's session record.
+  //
+  // Each call site used to do its own read-modify-write of the shared file: a
+  // prompt start registered the session, stamped the pulse, presence ticks
+  // pinged liveness, and a busy session rewrote the whole state again on every
+  // tool call. A turn's worth of housekeeping cost several full cycles of a
+  // file every other Pi on the node is also reading and rewriting.
+  //
+  // The record is written when something a teammate could act on actually
+  // changed - status, focus, checkpoint, working directory, mentioned paths, and
+  // the stamps delivery decisions read - or when the presence clock says a live
+  // session still has to advertise itself. A newer timestamp on its own is not
+  // news, and peers do not wait on it: the network service syncs every few
+  // seconds and only reads liveness from records that are already fresh.
+  let lastRecordWriteAt = 0;
+  let writtenRecord: WorkSession | undefined;
+
+  async function writeSessionRecord(next: WorkSession, options: { force?: boolean } = {}): Promise<void> {
+    const changed = !writtenRecord || writtenRecord.id !== next.id ||
+      writtenRecord.status !== next.status ||
+      writtenRecord.name !== next.name ||
+      writtenRecord.focus !== next.focus ||
+      writtenRecord.focusPinned !== next.focusPinned ||
+      writtenRecord.checkpoint !== next.checkpoint ||
+      writtenRecord.recentPaths !== next.recentPaths ||
+      writtenRecord.cwd !== next.cwd ||
+      writtenRecord.project !== next.project ||
+      writtenRecord.branch !== next.branch ||
+      writtenRecord.connected !== next.connected ||
+      writtenRecord.lastReadAt !== next.lastReadAt ||
+      writtenRecord.lastPulseAt !== next.lastPulseAt;
+    if (!options.force && !changed && Date.now() - lastRecordWriteAt < HEARTBEAT_MS) return;
+    lastRecordWriteAt = Date.now();
+    writtenRecord = next;
+    await updateState((state) => {
+      state.sessions = state.sessions.some((item) => item.id === next.id)
+        ? state.sessions.map((item) => item.id === next.id ? next : item)
+        : [next, ...state.sessions].slice(0, LIMITS.maxSessions);
+    });
+  }
+
+  async function ensureSession(
+    ctx: ContextLike,
+    status: SessionStatus = "idle",
+    options: { force?: boolean; paths?: string[]; pulseAt?: string } = {},
+  ): Promise<WorkSession> {
     projectInfo ??= await gitInfo(pi, ctx.cwd);
     const id = sessionId(ctx);
-    const persisted = (await loadState()).sessions.find((item) => item.id === id);
+    const persisted = (await readState()).sessions.find((item) => item.id === id);
     const existing = current?.id === id ? current : persisted;
     const inferredFocus = recentUserPrompt(ctx);
     const focus = existing?.focusPinned ? existing.focus : (status === "working" ? inferredFocus : existing?.focus || inferredFocus);
@@ -719,25 +812,23 @@ export default function (pi: ExtensionAPI) {
       updatedAt: timestamp,
       lastSeenAt: timestamp,
       lastReadAt: existing?.lastReadAt,
-      lastPulseAt: existing?.lastPulseAt,
+      // Turn-start bookkeeping can be folded into this call (see
+      // before_agent_start) so one prompt does not cost two writes of the room.
+      lastPulseAt: options.pulseAt || existing?.lastPulseAt,
       checkpoint: existing?.checkpoint,
-      recentPaths: existing?.recentPaths || [],
+      recentPaths: options.paths || existing?.recentPaths || [],
     };
     current = next;
     protectedSessionIds.add(id);
-    await updateState((state) => {
-      state.sessions = [next, ...state.sessions.filter((item) => item.id !== id)].slice(0, LIMITS.maxSessions);
-    });
+    await writeSessionRecord(next, { force: options.force });
     return next;
   }
 
   async function heartbeatOnce(ctx: ContextLike, status: SessionStatus): Promise<void> {
     if (!current) return;
     const snapshot = current;
-    current = { ...snapshot, status, updatedAt: now(), lastSeenAt: now() };
-    await updateState((state) => {
-      state.sessions = state.sessions.map((item) => item.id === snapshot.id ? current! : item);
-    });
+    current = { ...snapshot, status, name: sessionName(ctx, snapshot.name), updatedAt: now(), lastSeenAt: now() };
+    await writeSessionRecord(current);
   }
 
   // Pi's own JSONL session is the canonical complete history. Keep a private
@@ -806,7 +897,7 @@ export default function (pi: ExtensionAPI) {
       if (!WAKE_ENABLED) return;
       if (Date.now() - lastAutoWakeAt < WAKE_MIN_GAP_MS) return;
       const idle = ctx.isIdle();
-      const pending = (await loadState()).messages
+      const pending = (await readState()).messages
         .filter((message) => message.toSessionId === current!.id && !message.deliveredAt && !locallySent.has(message.id) &&
           (message.kind === "question" || message.kind === "delegation" || message.kind === "reply"))
         .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
@@ -904,13 +995,8 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  async function markPulseShown(at: string): Promise<void> {
-    if (!current) return;
-    current = { ...current, lastPulseAt: at };
-    await updateState((state) => {
-      state.sessions = state.sessions.map((item) => item.id === current!.id ? current! : item);
-    });
-  }
+  // The pulse stamp is folded into ensureSession's options at turn start; a
+  // separate write here would rewrite the whole room a second time per prompt.
 
   // Build the themed summary used by both the live widget and the regular-mode
   // overlay. The overlay can reserve a trailing blank row so an expanded
@@ -1217,7 +1303,7 @@ export default function (pi: ExtensionAPI) {
   // Live always-on summary widget (never touches LLM context).
   async function refreshWidget(ctx: ContextLike): Promise<void> {
     if (!current || !ctx.hasUI) return;
-    const state = await loadState();
+    const state = await readState();
     const session = current;
     const expanded = summaryExpanded;
 
@@ -1252,7 +1338,7 @@ export default function (pi: ExtensionAPI) {
 
   async function appendSummaryCard(session: WorkSession): Promise<void> {
     pi.appendEntry(SUMMARY_TYPE, {
-      lines: renderSummaryLines(await loadState(), session),
+      lines: renderSummaryLines(await readState(), session),
       updatedAt: now(),
     });
   }
@@ -1411,7 +1497,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_info_changed", async (_event, ctx) => {
     if (!current) return;
     current = { ...current, name: sessionName(ctx, current.name), updatedAt: now(), lastSeenAt: now() };
-    await updateState((state) => { state.sessions = state.sessions.map((item) => item.id === current!.id ? current! : item); });
+    await writeSessionRecord(current);
     queueSessionHistory(ctx);
   });
 
@@ -1428,12 +1514,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    const session = await ensureSession(ctx, "working");
-    const state = await loadState();
-    const pulse = renderPulse(state, session);
-    const checkpoint = session.checkpoint ? `\n\nYour current checkpoint:\n- ${session.checkpoint.text}` : "";
+    // One transaction for the whole turn start. This used to be three separate
+    // operations on the shared file: register the session, then a full read for
+    // the pulse render, then a stamp write for the pulse itself. The paths the
+    // prompt mentioned are folded into the same record, and the pulse render
+    // goes through the cached read.
     const pulseAt = now();
-    await markPulseShown(pulseAt);
+    const paths = mentionedPaths(event.messageType === "user" ? event.prompt : undefined);
+    const session = await ensureSession(ctx, "working", { paths, pulseAt });
+    const pulse = renderPulse(await readState(), session);
+    const checkpoint = session.checkpoint ? `\n\nYour current checkpoint:\n- ${session.checkpoint.text}` : "";
     return {
       // Use the system prompt rather than a persistent custom message: the
       // pulse is ambient state for this turn, not another transcript entry.
@@ -1458,6 +1548,7 @@ export default function (pi: ExtensionAPI) {
     heartbeat = undefined;
     if (current) {
       const snapshot = { ...current, status: "idle" as SessionStatus, connected: false, updatedAt: now(), lastSeenAt: now() };
+      current = snapshot;
       // Fallback breadcrumb: if the session never saved an explicit checkpoint
       // but was meaningfully active, leave an auto checkpoint derived from its
       // focus/latest prompt so teammates still get a resume point.
@@ -1465,7 +1556,7 @@ export default function (pi: ExtensionAPI) {
         const hint = snapshot.focus || recentUserPrompt(ctx);
         if (hint) snapshot.checkpoint = { text: `[auto] ${truncate(hint, MAX_CHECKPOINT_LENGTH)}`, updatedAt: now(), sessionId: snapshot.id, auto: true };
       }
-      await updateState((state) => { state.sessions = state.sessions.map((item) => item.id === snapshot.id ? snapshot : item); });
+      await writeSessionRecord(snapshot, { force: true });
     }
     closeSummaryOverlay();
     closeRegularNotice();
@@ -1497,14 +1588,14 @@ export default function (pi: ExtensionAPI) {
       const session = await ensureSession(ctx, "working");
       switch (params.action) {
         case "pulse": {
-          const state = await loadState();
+          const state = await readState();
           return toolResult("pulse", renderPulse(state, session));
         }
         case "focus": {
           if (!params.text?.trim()) return toolResult("focus", session.focus ? `Current focus: ${session.focus}` : "No focus recorded.");
           const clean = truncate(params.text, 180);
           current = { ...session, focus: clean, focusPinned: true, updatedAt: now(), lastSeenAt: now() };
-          await updateState((state) => { state.sessions = state.sessions.map((item) => item.id === current!.id ? current! : item); });
+          await writeSessionRecord(current, { force: true });
           return toolResult("focus", `Focus updated: ${clean}`);
         }
         case "update":
@@ -1525,7 +1616,7 @@ export default function (pi: ExtensionAPI) {
         case "reply":
           return toolResult("reply", await replyToMessage(params.messageId || "", params.text || "", normalizeDelivery(params.delivery)));
         case "inbox": {
-          const state = await loadState();
+          const state = await readState();
           const messages = unreadMessages(state, session);
           await markRead();
           return toolResult("inbox", renderInbox(messages));
@@ -1544,7 +1635,7 @@ export default function (pi: ExtensionAPI) {
           return toolResult("remember", `Saved to shared history: ${clean}`);
         }
         case "history": {
-          const state = await loadState();
+          const state = await readState();
           return toolResult("history", renderHistory(searchJournal(state, session, params.query || params.text)));
         }
       }
@@ -1560,7 +1651,7 @@ export default function (pi: ExtensionAPI) {
       try {
         if (!subcommand || subcommand === "summary") {
           await appendSummaryCard(session);
-          ctx.ui.notify(renderPulse(await loadState(), session), "info");
+          ctx.ui.notify(renderPulse(await readState(), session), "info");
           await refreshWidget(ctx);
           return;
         }
@@ -1598,7 +1689,7 @@ export default function (pi: ExtensionAPI) {
           const parsed = splitCommandDelivery(replyWords);
           ctx.ui.notify(await replyToMessage(messageId || "", parsed.words.join(" "), parsed.delivery), "info");
         } else if (subcommand === "inbox") {
-          const messages = unreadMessages(await loadState(), session);
+          const messages = unreadMessages(await readState(), session);
           await markRead();
           const inboxText = renderInbox(messages);
           if (ctx.mode === "tui" && activeWidgetTui?.mode === "regular") showRegularNotice(ctx, inboxText, "info");
@@ -1615,7 +1706,7 @@ export default function (pi: ExtensionAPI) {
           });
           ctx.ui.notify(`Saved to shared history: ${clean}`, "info");
         } else if (subcommand === "history") {
-          ctx.ui.notify(renderHistory(searchJournal(await loadState(), session, text)), "info");
+          ctx.ui.notify(renderHistory(searchJournal(await readState(), session, text)), "info");
         } else {
           ctx.ui.notify("Usage: /team [focus|update|ask|delegate|steer|reply|inbox|checkpoint|remember|history] ...", "warning");
         }

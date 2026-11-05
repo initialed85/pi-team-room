@@ -34,7 +34,7 @@ Or test the extension directly:
 pi -e $(pwd)/extension.ts
 ```
 
-The extension stores shared state in `~/.pi/team-room/state.json` by default. Set `PI_TEAM_ROOM_STATE` to use another path. This is a **machine-wide room on one host**: every Pi session running as this user can see the other live sessions, regardless of which project directory or Git repository they are using.
+The extension stores shared state in `~/.pi/team-room/state.json` by default. Set `PI_TEAM_ROOM_STATE` to use another path. `pi-team-state` reports how big that file has grown and what the retention rules would drop, and `pi-team-state --apply` prunes it in place. This is a **machine-wide room on one host**: every Pi session running as this user can see the other live sessions, regardless of which project directory or Git repository they are using.
 
 ## Commands
 
@@ -193,14 +193,16 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 
 - Presence is ephemeral-ish: stale sessions are hidden from the pulse after 30 minutes, but their last checkpoint and history remain.
 - Updates are capped and deduplicated to avoid turning the team room into a tool-call transcript.
-- Text budgets are split by role. One-line surfaces (status updates, journal facts, pulse lines, send confirmations) are capped and flattened: 500 characters for an update, 2,000 for a checkpoint, 400 per pulse message line, 300 for a confirmation preview. Direct teammate messages and delegation briefs are stored as prose with their paragraph breaks and get their own budgets: 6,000 characters of message text and 3,000 per delegation field. A pulse or confirmation line is a preview that says how long the full message was; `inbox` and wakes always carry the whole brief. Shared state additionally holds at most 200,000 characters of stored message text, dropping the oldest messages first.
+- Text budgets are split by role. One-line surfaces (status updates, journal facts, pulse lines, send confirmations) are capped and flattened: 500 characters for an update, 2,000 for a checkpoint, 400 per pulse message line, 300 for a confirmation preview. Direct teammate messages and delegation briefs are stored as prose with their paragraph breaks and get their own budgets: 6,000 characters of message text and 3,000 per delegation field. A pulse or confirmation line is a preview that says how long the full message was; `inbox` and wakes always carry the whole brief. - Shared state additionally holds at most 100,000 characters of stored message text, dropping the oldest messages first, and the whole file is capped at 150,000 serialized characters (see the retention knobs below) so a Pi's per-turn cost stays bounded however the room is configured.
 - The pulse is injected into the current turn's system prompt, so it does not create persistent transcript clutter.
 - Senders get a current-but-advisory peer status/focus snapshot when asking; auto delivery is resolved again by the recipient at delivery time because status can change between the two.
 - Each session gets a durable session id, allowing messages to target a specific peer even when display names repeat.
 - The extension reads and writes the state atomically enough for local peer processes using a lock file and rename-based writes.
+- The room is bounded by **age** as well as by count. `state-rules.mjs` holds the retention windows and ceilings, and both writers (the extension and the network node) apply them on every write. That is what makes pruning converge instead of circular: the network node POSTs whole snapshots to peers, so a record one host dropped would otherwise be re-imported by the next peer and circulate forever. `pi-team-state` reports or applies the same rules for a host that was offline long enough to accumulate history.
+- Cost is paid per read and per write, not per byte on disk. Read-only paths (pulse, widget, inbox poll, history search) go through a cached read validated by file identity (inode, size, mtime) rather than re-parsing the room each time, and this session's record is written when something a teammate could act on changes - status, focus, checkpoint, paths, the stamps delivery decisions read - or when the presence clock says a live session must keep advertising itself. A turn start is one write carrying the registration, the mentioned paths, and the pulse stamp, instead of three.
 - Shared state is best-effort: if another Pi instance is unavailable, the local session keeps working.
 - All sessions on this machine share one room. Project/repository paths and branches are retained as labels so parallel work remains distinguishable without making any project invisible.
-- `npm test` runs core, network, and session-history integration harnesses using isolated extension instances and temporary state files. The harnesses reuse Pi's own bundled `jiti` and peer dependencies, resolved from the managed install layout (`~/.pi/agent/install/releases/<version>/node_modules`, following `PI_MANAGED_INSTALL_ROOT`); set `PI_TEAM_ROOM_TEST_NODE_MODULES` to point at a specific `node_modules` directory when Pi lives somewhere unusual.
+- `npm test` runs core, network, session-history, and state-rules integration harnesses using isolated extension instances and temporary state files. The harnesses reuse Pi's own bundled `jiti` and peer dependencies, resolved from the managed install layout (`~/.pi/agent/install/releases/<version>/node_modules`, following `PI_MANAGED_INSTALL_ROOT`); set `PI_TEAM_ROOM_TEST_NODE_MODULES` to point at a specific `node_modules` directory when Pi lives somewhere unusual.
 - Session history is a private local projection of Pi JSONL. It is intentionally separate from team-room coordination state and is never network-synchronized by this extension.
 
 ## Knobs
@@ -211,6 +213,15 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 | `PI_SESSION_HISTORY` | `1` | Maintain per-session SQLite history sidecars (`0` disables automatic indexing) |
 | `PI_SESSION_HISTORY_DIR` | `~/.pi/agent/session-history` | Per-session SQLite sidecar directory |
 | `PI_TEAM_ROOM_HEARTBEAT_MS` | `15000` | Presence ping, widget refresh, and summary clock |
+| `PI_TEAM_ROOM_SESSION_RETENTION_HOURS` | `6` | How long a cleanly exited session record is kept as a resume point |
+| `PI_TEAM_ROOM_SESSION_GONE_HOURS` | `24` | Age at which a silent session record is pruned even without a shutdown record |
+| `PI_TEAM_ROOM_MESSAGE_RETENTION_HOURS` | `24` | Age at which direct messages, questions, delegations and replies are pruned |
+| `PI_TEAM_ROOM_UPDATE_RETENTION_HOURS` | `24` | Age at which pulse updates are pruned (the pulse reads "since you were last here") |
+| `PI_TEAM_ROOM_JOURNAL_RETENTION_DAYS` | `30` | Age at which shared journal entries are pruned |
+| `PI_TEAM_ROOM_MAX_STATE_CHARS` | `150000` | Serialized-size ceiling; oldest records are dropped first when it would be exceeded |
+| `PI_TEAM_ROOM_MAX_MESSAGE_CHARS` | `100000` | Stored direct-message text budget |
+| `PI_TEAM_ROOM_MAX_JOURNAL` / `PI_TEAM_ROOM_MAX_JOURNAL_CHARS` | `200` / `60000` | Journal record and text budgets |
+| `PI_TEAM_ROOM_MAX_SESSIONS` / `PI_TEAM_ROOM_MAX_MESSAGES` / `PI_TEAM_ROOM_MAX_UPDATES` | `100` / `5000` / `60` | Record-count ceilings |
 | `PI_TEAM_ROOM_WAKE` | `1` | Allow automatic direct-message delivery and wake/queue behavior (`0` disables) |
 | `PI_TEAM_ROOM_INBOX_MS` | `1000` | Direct-message poll period (independent of the presence clock) |
 | `PI_TEAM_ROOM_WAKE_MIN_GAP_MS` | `1000` | Minimum gap between automatic wake turns; queued messages coalesce into one |

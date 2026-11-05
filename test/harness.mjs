@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -526,6 +526,39 @@ try {
   const stateAfterContention = JSON.parse(readFileSync(statePath, "utf8"));
   assert.ok(stateAfterContention.messages.some((message) => message.id === foreignMessage.id), "a concurrent write is not overwritten");
 
+  // Cost discipline, not only correctness. Every read path used to rewrite the
+  // shared file - a pulse burst, a turn start, a presence tick - and each
+  // rewrite is a read, parse, prune and rename of a file that every Pi process
+  // on the node is also touching, paid inside the session.
+  const churn = makePeer("17171717-1111-2222-3333-444444444444", "churn", true, "/tmp/project-churn");
+  await churn.handlers.session_start({}, churn.ctx);
+  await call(churn, { action: "pulse" });
+  const settledInode = statSync(statePath).ino;
+  for (let index = 0; index < 12; index++) await call(churn, { action: "pulse" });
+  assert.equal(statSync(statePath).ino, settledInode, "a burst of pulse calls does not rewrite the shared state");
+  await call(churn, { action: "focus", text: "measuring write churn" });
+  assert.notEqual(statSync(statePath).ino, settledInode, "something a teammate could act on is written at once");
+  const churnRecord = JSON.parse(readFileSync(statePath, "utf8")).sessions.find((session) => session.id === churn.ctx.sessionManager.getSessionId());
+  assert.equal(churnRecord.focus, "measuring write churn", "the coalesced writer still lands a focus change");
+
+  // A turn start used to be three operations on the file: register the session,
+  // read the whole room to render the pulse, then write again to stamp the
+  // pulse. One write has to carry all of it now.
+  const promptStart = await churn.handlers.before_agent_start(
+    { systemPrompt: "BASE", messageType: "user", prompt: "fix /tmp/project-churn/src/auth.ts" },
+    churn.ctx,
+  );
+  assert.match(promptStart.systemPrompt, /^BASE/, "the pulse is still injected into the system prompt");
+  const promptedRecord = JSON.parse(readFileSync(statePath, "utf8")).sessions.find((session) => session.id === churn.ctx.sessionManager.getSessionId());
+  assert.equal(promptedRecord.status, "working", "the turn start still registers the session as working");
+  assert.ok(promptedRecord.lastPulseAt, "the pulse stamp lands in the same write as the record");
+  assert.deepEqual(promptedRecord.recentPaths, ["/tmp/project-churn/src/auth.ts"], "the record carries the paths the prompt mentioned");
+
+  // Cheap reads are only allowed while they stay correct: a peer's write must
+  // still reach this session's next render, or the room quietly stops sharing.
+  await call(golf, { action: "update", text: "an update written after the read cache was warm" });
+  assert.match(await call(churn, { action: "pulse" }), /read cache was warm/, "a cached read is invalidated when a peer writes the room");
+
   // The merge helper used by that path keeps the record that progressed further,
   // so a stale copy cannot undo a delivered or read marker.
   const merged = extension.mergeById(
@@ -650,6 +683,7 @@ try {
   await flaky.handlers.session_shutdown({}, flaky.ctx);
   await foxtrot.handlers.session_shutdown({}, foxtrot.ctx);
   await manual.handlers.session_shutdown({}, manual.ctx);
+  await churn.handlers.session_shutdown({}, churn.ctx);
   await echo.handlers.session_shutdown({}, echo.ctx);
   await golf.handlers.session_shutdown({}, golf.ctx);
   await hotel.handlers.session_shutdown({}, hotel.ctx);
