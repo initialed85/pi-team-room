@@ -15,6 +15,13 @@ const SYNC_MS = Number(process.env.PI_TEAM_ROOM_SYNC_MS) || 5_000;
 const LEASE_GRACE_MS = Number(process.env.PI_TEAM_ROOM_NODE_GRACE_MS) || 120_000;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const STALE_SESSION_MS = 90_000;
+const PEER_REQUEST_TIMEOUT_MS = 2_000;
+// A room is usually one or two laptops and a desktop, but a laptop that is asleep
+// only reveals it after the request timeout. Syncing peers one after another made
+// that one peer delay every other peer's update, cycle after cycle.
+const PEER_CONCURRENCY = 4;
+const PEER_BACKOFF_BASE_MS = 1_000;
+const PEER_BACKOFF_MAX_MS = 60_000;
 // Record caps and retention windows come from the same module the Pi side uses.
 // Both writers must prune identically, because this service POSTs whole state
 // snapshots to peers: a record one node dropped would otherwise be re-imported
@@ -45,6 +52,9 @@ let leaseTimer;
 let syncing = false;
 let noSessionsSince;
 let stopping = false;
+// endpoint -> { failures, lastSuccessAt, lastFailureAt, lastError, nextAttemptAt }
+const peerHealth = new Map();
+let stateQueue = Promise.resolve();
 
 function emptyState() {
   return { version: 1, sessions: [], messages: [], updates: [], journal: [] };
@@ -82,6 +92,16 @@ async function saveState(state) {
 }
 
 async function withState(fn) {
+  // Peer syncs now run concurrently, but this node's room is a single file.
+  // Same-process callers queue behind one another rather than each trying to win
+  // the cross-process lock, so a parallel sync cycle spends its time merging
+  // instead of retrying EEXIST.
+  const run = stateQueue.then(() => withStateLock(fn));
+  stateQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+async function withStateLock(fn) {
   const path = STATE_PATH;
   const lock = `${path}.lock`;
   await mkdir(dirname(path), { recursive: true });
@@ -243,6 +263,12 @@ server = createServer(async (request, response) => {
       sendJson(response, 200, { protocol: PROTOCOL_VERSION, nodeId: node.id, name: node.name });
       return;
     }
+    if (request.url === "/v1/peers" && request.method === "GET") {
+      // Behind the shared secret on purpose: peer endpoints are LAN details, and
+      // /healthz answers without one.
+      sendJson(response, 200, { peers: peerSummary() });
+      return;
+    }
     if (request.url === "/v1/state" && request.method === "GET") {
       sendJson(response, 200, await loadState());
       return;
@@ -281,7 +307,7 @@ function peerEndpoints() {
 async function fetchJson(endpoint, options = {}) {
   const response = await fetch(endpoint, {
     ...options,
-    signal: AbortSignal.timeout(2_000),
+    signal: AbortSignal.timeout(PEER_REQUEST_TIMEOUT_MS),
     headers: { authorization: `Bearer ${SHARED_SECRET}`, ...(options.headers || {}) },
   });
   if (!response.ok) throw new Error(`peer returned HTTP ${response.status}`);
@@ -302,16 +328,55 @@ async function syncAll() {
   if (syncing || stopping) return;
   syncing = true;
   try {
-    for (const endpoint of peerEndpoints()) {
-      try {
-        await syncPeer(endpoint);
-      } catch {
-        // Peers can be asleep or temporarily unreachable; discovery retries later.
-      }
+    const endpoints = peerEndpoints();
+    const now = Date.now();
+    const due = endpoints.filter((endpoint) => {
+      const health = peerHealth.get(endpoint);
+      return !health?.nextAttemptAt || health.nextAttemptAt <= now;
+    });
+    for (let index = 0; index < due.length; index += PEER_CONCURRENCY) {
+      const batch = due.slice(index, index + PEER_CONCURRENCY);
+      const results = await Promise.allSettled(batch.map((endpoint) => syncPeer(endpoint)));
+      if (stopping) return;
+      for (let position = 0; position < batch.length; position++) recordPeerOutcome(batch[position], results[position]);
     }
+    // A peer that stopped being advertised should not keep a health entry forever.
+    for (const endpoint of [...peerHealth.keys()]) if (!endpoints.includes(endpoint)) peerHealth.delete(endpoint);
   } finally {
     syncing = false;
   }
+}
+
+function recordPeerOutcome(endpoint, result) {
+  const previous = peerHealth.get(endpoint) || { failures: 0 };
+  if (result.status === "fulfilled") {
+    peerHealth.set(endpoint, { failures: 0, lastSuccessAt: new Date().toISOString(), nextAttemptAt: 0 });
+    return;
+  }
+  // Back off a peer that is not answering: it is usually a sleeping laptop, not a
+  // bug, and hammering it every cycle costs a timeout window each time.
+  const failures = previous.failures + 1;
+  const delay = Math.min(PEER_BACKOFF_MAX_MS, PEER_BACKOFF_BASE_MS * 2 ** Math.min(failures - 1, 6));
+  peerHealth.set(endpoint, {
+    failures,
+    lastFailureAt: new Date().toISOString(),
+    lastError: result.reason instanceof Error ? result.reason.message : String(result.reason),
+    nextAttemptAt: Date.now() + delay,
+  });
+}
+
+function peerSummary() {
+  const endpoints = new Set([...peerEndpoints(), ...peerHealth.keys()]);
+  return [...endpoints].slice(0, 32).map((endpoint) => {
+    const health = peerHealth.get(endpoint);
+    return {
+      endpoint,
+      failures: health?.failures || 0,
+      ...(health?.lastSuccessAt ? { lastSuccessAt: health.lastSuccessAt } : {}),
+      ...(health?.lastFailureAt ? { lastFailureAt: health.lastFailureAt, lastError: health.lastError } : {}),
+      ...(health?.nextAttemptAt ? { nextRetryAt: new Date(health.nextAttemptAt).toISOString() } : {}),
+    };
+  });
 }
 
 async function checkLease() {
@@ -361,8 +426,12 @@ function stop() {
   try { browser?.stop(); } catch { /* best effort */ }
   try { published?.stop(); } catch { /* best effort */ }
   try { bonjour?.destroy(); } catch { /* best effort */ }
+  // Closing the listener is not enough while a peer still holds a keep-alive
+  // socket: a service that was asked to stop has to stop, or it holds whatever
+  // process was waiting on it open for minutes.
+  try { server?.closeAllConnections?.(); } catch { /* best effort */ }
   server?.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 500).unref();
+  setTimeout(() => process.exit(0), 500);
 }
 
 process.on("SIGTERM", stop);
