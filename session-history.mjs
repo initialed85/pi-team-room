@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, closeSync } from "node:fs";
 
 // node:sqlite is available in the supported Node range but remains marked
 // experimental in Node 22. Keep its one-time runtime warning from appearing
@@ -138,6 +138,40 @@ function ensurePrivateDirectory(path) {
 
 function ensurePrivateFile(path) {
   try { chmodSync(path, 0o600); } catch { /* best effort on platforms without chmod */ }
+}
+
+// Which transcript a sidecar was built from, as recorded in the sidecar itself.
+const STAMP_PREFIX = "sync_stamp:";
+const PREFIX_PREFIX = "sync_prefix:";
+const SESSION_HEADER_PEEK_BYTES = 16_384;
+
+function fileStamp(sessionFile) {
+  try {
+    const info = statSync(sessionFile);
+    return `${info.size}:${Math.round(info.mtimeMs)}`;
+  } catch {
+    return null;
+  }
+}
+
+// The session id lives on the first line of the JSONL, so a sidecar can be
+// located without reading the transcript. Only the first few kilobytes are
+// touched; a header that does not fit is treated as unknown rather than parsed
+// partially.
+function peekSessionId(sessionFile) {
+  let handle;
+  try {
+    handle = openSync(sessionFile, "r");
+    const buffer = Buffer.alloc(SESSION_HEADER_PEEK_BYTES);
+    const read = readSync(handle, buffer, 0, SESSION_HEADER_PEEK_BYTES, 0);
+    const firstLine = buffer.subarray(0, read).toString("utf8").split("\n")[0];
+    const header = JSON.parse(firstLine);
+    return typeof header?.id === "string" && header.id ? header.id : null;
+  } catch {
+    return null;
+  } finally {
+    if (handle !== undefined) { try { closeSync(handle); } catch { /* already closed */ } }
+  }
 }
 
 export function openHistoryDatabase(path, { initialize = true } = {}) {
@@ -342,31 +376,111 @@ function rebuildToolCalls(db, sessionId) {
   }
 }
 
+function insertEntryRows(db, sessionId, rows) {
+  const insertEntry = db.prepare(`
+    INSERT INTO entries(session_id, entry_id, ordinal, parent_id, type, timestamp, role, text, command, tool_name, tool_call_id, is_error, raw_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertBlock = db.prepare(`
+    INSERT INTO content_blocks(session_id, entry_id, block_index, type, text, name, tool_call_id, arguments_json, raw_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const row of rows) {
+    const item = row.entry;
+    insertEntry.run(sessionId, item.entryId, item.ordinal, item.parentId, item.type, item.timestamp, item.role, item.text,
+      item.command, item.toolName, item.toolCallId, item.isError, item.rawJson);
+    for (const block of row.blocks) {
+      insertBlock.run(sessionId, item.entryId, block.blockIndex, block.type, block.text, block.name, block.toolCallId,
+        block.argumentsJson, block.rawJson);
+    }
+  }
+}
+
+// Tool-call pairing restricted to the appended tail. A call's result can only
+// arrive after the call, so new calls are paired with any result that arrived in
+// the same batch, and results arriving now are joined to calls stored by an
+// earlier sync. First result wins, matching the full rebuild.
+function linkAppendedToolCalls(db, sessionId, rows) {
+  const insertCall = db.prepare(`
+    INSERT INTO tool_calls(session_id, call_entry_id, block_index, call_id, tool_name, arguments_json, called_at, result_entry_id, result_json, result_text, result_is_error, result_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const linkCall = db.prepare(`
+    UPDATE tool_calls SET result_entry_id = ?, result_json = ?, result_text = ?, result_is_error = ?, result_at = ?
+    WHERE session_id = ? AND call_id = ? AND result_entry_id IS NULL
+  `);
+  const results = new Map();
+  for (const row of rows) {
+    if (!row.entry.toolCallId) continue;
+    if (!results.has(row.entry.toolCallId)) results.set(row.entry.toolCallId, row.entry);
+  }
+  for (const row of rows) {
+    for (const block of row.blocks) {
+      if (block.type !== "toolCall" || !block.toolCallId) continue;
+      const result = results.get(block.toolCallId);
+      insertCall.run(sessionId, row.entry.entryId, block.blockIndex, block.toolCallId, block.name || "tool", block.argumentsJson,
+        row.entry.timestamp, result?.entryId ?? null, result?.rawJson ?? null, result?.text ?? null, result?.isError ?? null,
+        result?.timestamp ?? null);
+    }
+  }
+  for (const result of results.values()) {
+    linkCall.run(result.entryId, result.rawJson, result.text, result.isError, result.timestamp, sessionId, result.toolCallId);
+  }
+}
+
+// How much of this transcript the sidecar already holds, or 0 when the whole
+// session has to be rewritten.
+//
+// Pi's JSONL is append-only, so a tail sync is only safe when what the sidecar
+// indexed is still byte-for-byte what the transcript starts with. The record is
+// a fingerprint of the indexed raw lines, so a rewrite anywhere in that prefix -
+// a branch switch, a tree rewrite, a renumbered tail - changes the fingerprint
+// and falls back to the full rebuild instead of appending onto a history the
+// transcript no longer contains.
+function prefixFingerprint(lines) {
+  return createHash("sha256").update(lines.join("\n")).digest("hex");
+}
+
+function appendablePrefix(db, sessionId, payload) {
+  const stored = db.prepare("SELECT source_file, selected_from, selected_to FROM sessions WHERE session_id = ?").get(sessionId);
+  if (!stored || stored.selected_from || stored.selected_to) return 0;
+  if (stored.source_file !== payload.sessionFile) return 0;
+
+  let record;
+  try {
+    record = JSON.parse(db.prepare("SELECT value FROM metadata WHERE key = ?").get(`${PREFIX_PREFIX}${sessionId}`)?.value || "");
+  } catch {
+    return 0;
+  }
+  if (!record || typeof record.entries !== "number" || typeof record.fingerprint !== "string") return 0;
+  if (record.entries === 0 || record.entries > payload.entries.length) return 0;
+
+  // The sidecar must agree with its own record before the record can vouch for
+  // the transcript: a sidecar that was merged, pruned, or half-written is
+  // rebuilt from scratch.
+  const shape = db.prepare("SELECT COUNT(*) AS entries, MAX(ordinal) AS last_ordinal FROM entries WHERE session_id = ?").get(sessionId);
+  const count = Number(shape?.entries || 0);
+  if (count !== record.entries || Number(shape?.last_ordinal) !== count - 1) return 0;
+  if (prefixFingerprint(payload.rawEntries.slice(0, record.entries)) !== record.fingerprint) return 0;
+  return count;
+}
+
 function writePayload(db, payload, options = {}) {
   const sessionId = sessionIdFor(payload);
   const rows = payload.entries.map((entry, index) => rowsForEntry(entry, index, payload.rawEntries[index]));
+  const prefix = appendablePrefix(db, sessionId, payload);
+  const fresh = prefix > 0 ? rows.slice(prefix) : rows;
   db.exec("BEGIN IMMEDIATE");
   try {
     upsertSession(db, payload, options, rows, sessionId);
-    db.prepare("DELETE FROM entries WHERE session_id = ?").run(sessionId);
-    const insertEntry = db.prepare(`
-      INSERT INTO entries(session_id, entry_id, ordinal, parent_id, type, timestamp, role, text, command, tool_name, tool_call_id, is_error, raw_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const insertBlock = db.prepare(`
-      INSERT INTO content_blocks(session_id, entry_id, block_index, type, text, name, tool_call_id, arguments_json, raw_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    for (const row of rows) {
-      const item = row.entry;
-      insertEntry.run(sessionId, item.entryId, item.ordinal, item.parentId, item.type, item.timestamp, item.role, item.text,
-        item.command, item.toolName, item.toolCallId, item.isError, item.rawJson);
-      for (const block of row.blocks) {
-        insertBlock.run(sessionId, item.entryId, block.blockIndex, block.type, block.text, block.name, block.toolCallId,
-          block.argumentsJson, block.rawJson);
-      }
+    if (prefix === 0) {
+      db.prepare("DELETE FROM entries WHERE session_id = ?").run(sessionId);
+      insertEntryRows(db, sessionId, rows);
+      rebuildToolCalls(db, sessionId);
+    } else {
+      insertEntryRows(db, sessionId, fresh);
+      linkAppendedToolCalls(db, sessionId, fresh);
     }
-    rebuildToolCalls(db, sessionId);
     db.exec("COMMIT");
   } catch (error) {
     try { db.exec("ROLLBACK"); } catch { /* preserve original error */ }
@@ -378,13 +492,49 @@ function writePayload(db, payload, options = {}) {
 /** Materialize or refresh one session's private SQLite history database. */
 export function syncSessionDatabase(options) {
   if (!options?.sessionFile) throw new Error("sessionFile is required");
+  const sessionFile = resolve(options.sessionFile);
+  const stamp = fileStamp(sessionFile);
+
+  // Reading and parsing a multi-megabyte transcript just to discover that
+  // nothing changed is most of the cost of an otherwise cheap sync. The first
+  // line of the JSONL carries the session id, and the file's own size and mtime
+  // say whether anything could have moved since the last index, so an unchanged
+  // session costs a header peek and two queries instead of a parse.
+  //
+  // Only taken for file-driven syncs: a caller that hands over in-memory
+  // entries may be holding something the file does not have yet.
+  if (stamp && !options.entries) {
+    const quickId = peekSessionId(sessionFile);
+    if (quickId) {
+      const quickPath = resolve(options.dbPath || join(options.historyDir || DEFAULT_HISTORY_DIR, `${quickId}.sqlite`));
+      if (existsSync(quickPath)) {
+        const db = openHistoryDatabase(quickPath, { initialize: false });
+        try {
+          const stored = db.prepare("SELECT value FROM metadata WHERE key = ?").get(`${STAMP_PREFIX}${quickId}`)?.value;
+          const indexed = Number(db.prepare("SELECT COUNT(*) AS entries FROM entries WHERE session_id = ?").get(quickId)?.entries || 0);
+          if (stored === stamp && indexed > 0) return quickPath;
+        } finally {
+          db.close();
+        }
+      }
+    }
+  }
+
   const payload = payloadFromOptions(options);
   const sessionId = sessionIdFor(payload);
   const dbPath = resolve(options.dbPath || join(options.historyDir || DEFAULT_HISTORY_DIR, `${sessionId}.sqlite`));
   ensurePrivateDirectory(dirname(dbPath));
   const db = openHistoryDatabase(dbPath);
   try {
-    writePayload(db, payload, options);
+    const indexed = writePayload(db, payload, options);
+    // What the sidecar now holds, so the next sync can tell an append from a
+    // rewrite without re-indexing, and can tell that nothing moved at all.
+    db.prepare("INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(`${PREFIX_PREFIX}${indexed}`, JSON.stringify({ entries: payload.entries.length, fingerprint: prefixFingerprint(payload.rawEntries) }));
+    if (stamp) {
+      db.prepare("INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+        .run(`${STAMP_PREFIX}${indexed}`, stamp);
+    }
   } finally {
     db.close();
     ensurePrivateFile(dbPath);

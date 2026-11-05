@@ -839,10 +839,13 @@ export default function (pi: ExtensionAPI) {
     const sessionFile = ctx.sessionManager.getSessionFile?.();
     if (!sessionFile) return; // --no-session / in-memory test sessions
     try {
+      // The JSONL file - not the in-memory entry array - is what gets indexed.
+      // Pi appends to that file as the turn proceeds, and reading it is what
+      // lets the indexer decide "nothing moved" or "only this tail is new"
+      // instead of re-serializing every entry of a multi-megabyte transcript on
+      // a 100 ms debounce.
       syncSessionDatabase({
         sessionFile,
-        header: ctx.sessionManager.getHeader?.() || undefined,
-        entries: ctx.sessionManager.getEntries(),
         sessionName: sessionName(ctx, current?.name || ""),
         historyDir: process.env.PI_SESSION_HISTORY_DIR,
       });
