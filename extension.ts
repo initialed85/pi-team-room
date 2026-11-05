@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 import { syncSessionDatabase } from "./session-history.mjs";
 import { pruneState, resolveLimits, serializeState } from "./state-rules.mjs";
@@ -54,6 +55,9 @@ const MAX_WAKE_BATCH = 5;
 const LOCK_STALE_MS = 15_000;
 const NETWORK_ENABLED = process.env.PI_TEAM_ROOM_NETWORK === "1";
 const NETWORK_SERVICE_PATH = fileURLToPath(new URL("./network-service.mjs", import.meta.url));
+const HISTORY_WORKER_PATH = fileURLToPath(new URL("./history-worker.mjs", import.meta.url));
+const HISTORY_SYNC_DEBOUNCE_MS = 100;
+const HISTORY_FLUSH_TIMEOUT_MS = 15_000;
 const AUTO_CHECKPOINT_MIN_MS = (() => {
   const parsed = Number(process.env.PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
@@ -738,7 +742,6 @@ export default function (pi: ExtensionAPI) {
   let regularNoticeComponent: unknown;
   let regularNoticeDone: (() => void) | undefined;
   let regularNoticeTimer: ReturnType<typeof setTimeout> | undefined;
-  let historySyncPromise: Promise<void> = Promise.resolve();
   let historySyncTimer: ReturnType<typeof setTimeout> | undefined;
   let historySyncContext: ContextLike | undefined;
   const regularOverlayComponents = new Set<unknown>();
@@ -834,58 +837,174 @@ export default function (pi: ExtensionAPI) {
   // Pi's own JSONL session is the canonical complete history. Keep a private
   // SQLite projection alongside it so it is queryable without changing the
   // session format or putting history into the shared team-room state.
-  async function syncSessionHistory(ctx: ContextLike): Promise<void> {
-    if (!HISTORY_ENABLED) return;
+  //
+  // Indexing is the heaviest thing this extension does - hundreds of rows of
+  // SQLite for a long transcript - so it runs in a worker thread rather than on
+  // the event loop that answers the agent. A job carries paths only, the
+  // transcript is read from disk in that thread, and at most one follow-up job
+  // waits: every job re-reads the same file, so a newer view subsumes an older
+  // one and a burst of session events cannot queue a pile of redundant work.
+  type HistoryJob = { sessionFile: string; sessionName?: string; historyDir?: string };
+
+  function historyJob(ctx: ContextLike): HistoryJob | undefined {
+    if (!HISTORY_ENABLED) return undefined;
     const sessionFile = ctx.sessionManager.getSessionFile?.();
-    if (!sessionFile) return; // --no-session / in-memory test sessions
-    try {
+    if (!sessionFile) return undefined; // --no-session / in-memory test sessions
+    return {
       // The JSONL file - not the in-memory entry array - is what gets indexed.
-      // Pi appends to that file as the turn proceeds, and reading it is what
-      // lets the indexer decide "nothing moved" or "only this tail is new"
-      // instead of re-serializing every entry of a multi-megabyte transcript on
-      // a 100 ms debounce.
-      syncSessionDatabase({
-        sessionFile,
-        sessionName: sessionName(ctx, current?.name || ""),
-        historyDir: process.env.PI_SESSION_HISTORY_DIR,
-      });
+      // Pi appends to that file as the turn proceeds, and reading it is what lets
+      // the indexer decide "nothing moved" or "only this tail is new" instead of
+      // re-serializing every entry of a multi-megabyte transcript.
+      sessionFile,
+      sessionName: sessionName(ctx, current?.name || ""),
+      historyDir: process.env.PI_SESSION_HISTORY_DIR,
+    };
+  }
+
+  let historyWorker: Worker | undefined;
+  let historyWorkerUnavailable = false;
+  let historyRunning = false;
+  let historyQueue: HistoryJob[] = [];
+  let historyIdle: Promise<void> | undefined;
+  let historyIdleRelease: (() => void) | undefined;
+
+  function historyIdleWait(): Promise<void> {
+    if (!historyIdle) historyIdle = new Promise<void>((resolveIdle) => { historyIdleRelease = resolveIdle; });
+    return historyIdle;
+  }
+
+  function historySettle(): void {
+    if (historyRunning || historyQueue.length) return;
+    const release = historyIdleRelease;
+    historyIdleRelease = undefined;
+    historyIdle = undefined;
+    release?.();
+  }
+
+  function historyIndex(job: HistoryJob): void {
+    try {
+      syncSessionDatabase(job);
     } catch {
       // History is an observability aid; a locked or malformed sidecar must
       // never interrupt the coding session.
     }
   }
 
-  function enqueueSessionHistory(ctx: ContextLike): void {
-    const pending = historySyncContext || ctx;
-    historySyncContext = undefined;
-    historySyncPromise = historySyncPromise
-      .then(() => syncSessionHistory(pending))
-      .catch(() => undefined);
+  function historyEnsureWorker(): Worker | undefined {
+    if (historyWorker) return historyWorker;
+    if (historyWorkerUnavailable) return undefined;
+    // Escape hatch for hosts that will not run worker threads, and for anyone
+    // debugging history indexing on the main thread.
+    if (process.env.PI_SESSION_HISTORY_WORKER === "0") return undefined;
+    try {
+      const worker = new Worker(HISTORY_WORKER_PATH);
+      worker.on("message", () => {
+        // Only hold the process open while a job is actually in flight; an idle
+        // indexer must not keep a Pi session alive.
+        worker.unref();
+        historyRunning = false;
+        historyPump();
+      });
+      worker.on("error", () => {
+        // An environment that will not run the worker must not lose history: it
+        // indexes inline for the rest of this session instead.
+        historyWorkerUnavailable = true;
+        historyWorker = undefined;
+        if (historyRunning) {
+          historyRunning = false;
+          historyPump();
+        }
+      });
+      worker.on("exit", () => {
+        historyWorker = undefined;
+        if (historyRunning) {
+          historyRunning = false;
+          historyPump();
+        }
+      });
+      // Presence ticks and prompts must not be held open by a background indexer.
+      worker.unref();
+      historyWorker = worker;
+      return worker;
+    } catch {
+      historyWorkerUnavailable = true;
+      return undefined;
+    }
+  }
+
+  function historyPump(): void {
+    if (historyRunning) return;
+    const job = historyQueue.shift();
+    if (!job) {
+      historySettle();
+      return;
+    }
+    const worker = historyEnsureWorker();
+    if (!worker) {
+      historyIndex(job);
+      historyPump();
+      return;
+    }
+    historyRunning = true;
+    try {
+      // ref() for the duration of the job: a shutdown that awaits this job must
+      // not let the event loop drain out from under it, and an unref'd worker's
+      // reply is not something Node keeps the process alive for.
+      worker.ref();
+      worker.postMessage({ options: job });
+    } catch {
+      historyRunning = false;
+      historyWorkerUnavailable = true;
+      historyWorker = undefined;
+      historyIndex(job);
+      historyPump();
+    }
+  }
+
+  function historyEnqueue(job: HistoryJob): Promise<void> {
+    if (historyQueue.length) historyQueue[0] = job;
+    else historyQueue.push(job);
+    const idle = historyIdleWait();
+    historyPump();
+    return idle;
   }
 
   function queueSessionHistory(ctx: ContextLike): void {
-    if (!HISTORY_ENABLED || !ctx.sessionManager.getSessionFile?.()) return;
+    if (!historyJob(ctx)) return;
     historySyncContext = ctx;
-    // Session events can arrive in bursts (for example, several tool results in
-    // one turn). Coalesce them so a long JSONL file is not fully re-indexed for
-    // every individual message-end event.
+    // Session events arrive in bursts - several tool results in one turn, then
+    // the assistant message that consumed them. One debounce, then one job.
     if (historySyncTimer) return;
     historySyncTimer = setTimeout(() => {
       historySyncTimer = undefined;
-      if (historySyncContext) enqueueSessionHistory(ctx);
-    }, 100);
-    historySyncTimer.unref?.();
+      const pending = historyJob(historySyncContext || ctx);
+      historySyncContext = undefined;
+      if (pending) historyEnqueue(pending);
+    }, HISTORY_SYNC_DEBOUNCE_MS);
+    // Deliberately not unref'd: a queued index must survive an otherwise idle
+    // loop, and session shutdown clears this timer and flushes instead.
   }
 
   async function flushSessionHistory(ctx: ContextLike): Promise<void> {
-    if (!HISTORY_ENABLED || !ctx.sessionManager.getSessionFile?.()) return;
     if (historySyncTimer) {
       clearTimeout(historySyncTimer);
       historySyncTimer = undefined;
     }
-    historySyncContext = ctx;
-    enqueueSessionHistory(ctx);
-    await historySyncPromise;
+    const job = historyJob(ctx);
+    if (job) {
+      const idle = historyEnqueue(job);
+      // Shutdown must not wait indefinitely on a worker that died mid-job.
+      await Promise.race([
+        idle,
+        new Promise<void>((resolveIdle) => { const timer = setTimeout(resolveIdle, HISTORY_FLUSH_TIMEOUT_MS); timer.unref?.(); }),
+      ]);
+    }
+    historySettle();
+    if (historyWorker) {
+      const worker = historyWorker;
+      historyWorker = undefined;
+      worker.terminate().catch(() => undefined);
+    }
   }
 
   // Periodic inbox poll: wake an idle session or queue a direct question/reply
@@ -1478,7 +1597,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     projectInfo = undefined;
     await ensureSession(ctx, "idle");
-    await syncSessionHistory(ctx);
+    // A resumed or continued session already has a transcript worth indexing
+    // before the first turn ends, but session start is not the place to pay for
+    // it either: queue it and let the worker take it.
+    const initialHistory = historyJob(ctx);
+    if (initialHistory) historyEnqueue(initialHistory);
     startNetworkService();
     await refreshWidget(ctx);
     heartbeat = setInterval(() => {

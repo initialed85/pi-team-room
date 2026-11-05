@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -9,13 +10,18 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const stateDir = await mkdtemp(join("/tmp", "pi-team-room-test-"));
 const statePath = join(stateDir, "state.json");
 process.env.PI_TEAM_ROOM_STATE = statePath;
-process.env.PI_TEAM_ROOM_HEARTBEAT_MS = "500";
 process.env.PI_TEAM_ROOM_INBOX_MS = "200";
 process.env.PI_TEAM_ROOM_WAKE = "1";
 // The production wake gap keeps a peer from being interrupted in a loop, and the
 // harness runs in about a second, so it needs a faster clock.
 process.env.PI_TEAM_ROOM_WAKE_MIN_GAP_MS = "10";
+// Presence is much faster than production, but not so fast that a timestamp-only
+// presence rewrite can land inside the write-churn burst measured later: that
+// burst is only meaningful while this session's own presence throttle - which
+// shares this clock - is still suppressing redundant rewrites.
+process.env.PI_TEAM_ROOM_HEARTBEAT_MS = "1500";
 process.env.PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS = "1";
+process.env.PI_SESSION_HISTORY_DIR = join(stateDir, "session-history");
 
 // Use Pi's own transpiler and bundled peer dependencies. The runtime network
 // dependency is installed from package.json; only core Pi peers need wiring for
@@ -526,38 +532,73 @@ try {
   const stateAfterContention = JSON.parse(readFileSync(statePath, "utf8"));
   assert.ok(stateAfterContention.messages.some((message) => message.id === foreignMessage.id), "a concurrent write is not overwritten");
 
-  // Cost discipline, not only correctness. Every read path used to rewrite the
-  // shared file - a pulse burst, a turn start, a presence tick - and each
-  // rewrite is a read, parse, prune and rename of a file that every Pi process
-  // on the node is also touching, paid inside the session.
-  const churn = makePeer("17171717-1111-2222-3333-444444444444", "churn", true, "/tmp/project-churn");
-  await churn.handlers.session_start({}, churn.ctx);
-  await call(churn, { action: "pulse" });
-  const settledInode = statSync(statePath).ino;
-  for (let index = 0; index < 12; index++) await call(churn, { action: "pulse" });
-  assert.equal(statSync(statePath).ino, settledInode, "a burst of pulse calls does not rewrite the shared state");
-  await call(churn, { action: "focus", text: "measuring write churn" });
-  assert.notEqual(statSync(statePath).ino, settledInode, "something a teammate could act on is written at once");
-  const churnRecord = JSON.parse(readFileSync(statePath, "utf8")).sessions.find((session) => session.id === churn.ctx.sessionManager.getSessionId());
-  assert.equal(churnRecord.focus, "measuring write churn", "the coalesced writer still lands a focus change");
+  // History indexing is the one thing this extension does that can take hundreds
+  // of milliseconds, and it used to take them on the agent's own event loop: a
+  // long transcript indexed inline on a debounce stalls every handler sharing
+  // that loop in the middle of a turn. It runs in a worker thread instead, and
+  // the agent side has to stay responsive while a big one runs.
+  const historyId = "19191919-1111-4222-8888-444444444444";
+  const transcriptPath = join(stateDir, "history-lane.jsonl");
+  const historyTranscript = (count) => {
+    const header = { type: "session", version: 3, id: historyId, timestamp: new Date(Date.now() - count * 1000).toISOString(), cwd: "/tmp/project-history" };
+    const entries = Array.from({ length: count }, (_, index) => index % 2 === 0
+      ? { type: "message", id: `hl-${index}`, parentId: index ? `hl-${index - 1}` : null, timestamp: new Date(Date.now() - (count - index) * 1000).toISOString(), message: { role: "assistant", content: [{ type: "toolCall", id: `hl-call-${index}`, name: "bash", arguments: { command: `echo ${index} ${"x".repeat(120)}` } }] } }
+      : { type: "message", id: `hl-${index}`, parentId: `hl-${index - 1}`, timestamp: new Date(Date.now() - (count - index) * 1000).toISOString(), message: { role: "toolResult", toolCallId: `hl-call-${index - 1}`, toolName: "bash", content: [{ type: "text", text: `out-${index}` }], isError: false } });
+    return [header, ...entries].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+  };
+  const historyPeer = makePeer(historyId, "history lane", true, "/tmp/project-history");
+  historyPeer.ctx.sessionManager.getSessionFile = () => transcriptPath;
+  await historyPeer.handlers.session_start({}, historyPeer.ctx);
+  await writeFile(transcriptPath, historyTranscript(6000));
 
-  // A turn start used to be three operations on the file: register the session,
-  // read the whole room to render the pulse, then write again to stamp the
-  // pulse. One write has to carry all of it now.
-  const promptStart = await churn.handlers.before_agent_start(
-    { systemPrompt: "BASE", messageType: "user", prompt: "fix /tmp/project-churn/src/auth.ts" },
-    churn.ctx,
-  );
-  assert.match(promptStart.systemPrompt, /^BASE/, "the pulse is still injected into the system prompt");
-  const promptedRecord = JSON.parse(readFileSync(statePath, "utf8")).sessions.find((session) => session.id === churn.ctx.sessionManager.getSessionId());
-  assert.equal(promptedRecord.status, "working", "the turn start still registers the session as working");
-  assert.ok(promptedRecord.lastPulseAt, "the pulse stamp lands in the same write as the record");
-  assert.deepEqual(promptedRecord.recentPaths, ["/tmp/project-churn/src/auth.ts"], "the record carries the paths the prompt mentioned");
+  const loopGaps = [];
+  let previousGapAt = Date.now();
+  const responsiveness = new Promise((resolvePromise) => {
+    const clock = setInterval(() => {
+      const at = Date.now();
+      loopGaps.push(at - previousGapAt);
+      previousGapAt = at;
+      if (loopGaps.length >= 90) {
+        clearInterval(clock);
+        resolvePromise();
+      }
+    }, 10);
+  });
+  await historyPeer.handlers.message_end({ message: { role: "assistant", content: [] } }, historyPeer.ctx);
+  await responsiveness;
+  const worstGap = Math.max(...loopGaps);
+  assert.ok(worstGap < 300, `the agent's own event loop stalled ${worstGap}ms while a transcript was indexed`);
 
-  // Cheap reads are only allowed while they stay correct: a peer's write must
-  // still reach this session's next render, or the room quietly stops sharing.
-  await call(golf, { action: "update", text: "an update written after the read cache was warm" });
-  assert.match(await call(churn, { action: "pulse" }), /read cache was warm/, "a cached read is invalidated when a peer writes the room");
+  const sidecarPath = join(process.env.PI_SESSION_HISTORY_DIR, `${historyId}.sqlite`);
+  const sidecarRow = (sql) => {
+    const db = new DatabaseSync(sidecarPath, { readOnly: true });
+    try {
+      return db.prepare(sql).get();
+    } finally {
+      db.close();
+    }
+  };
+  await historyPeer.handlers.session_shutdown({}, historyPeer.ctx);
+  assert.ok(existsSync(sidecarPath), "the queued history job lands before the session ends");
+  assert.equal(sidecarRow("SELECT COUNT(*) AS count FROM entries").count, 6000, "the whole transcript is indexed");
+  assert.equal(sidecarRow("SELECT COUNT(*) AS count FROM tool_calls WHERE result_entry_id IS NOT NULL").count, 3000, "tool calls are paired with results across batches");
+
+  // And shutdown genuinely waits for the job it queued: with the sidecar gone,
+  // the only way the rows are there when shutdown returns is that the index ran
+  // before shutdown finished.
+  await rm(sidecarPath, { force: true });
+  await historyPeer.handlers.session_shutdown({}, historyPeer.ctx);
+  assert.equal(sidecarRow("SELECT COUNT(*) AS count FROM entries").count, 6000, "shutdown waits for the history job it queued");
+
+  // An environment that will not run the worker thread still gets history: the
+  // same queue falls back to indexing inline.
+  process.env.PI_SESSION_HISTORY_WORKER = "0";
+  await appendFile(transcriptPath, `${JSON.stringify({ type: "message", id: "hl-tail", parentId: "hl-3999", timestamp: new Date().toISOString(), message: { role: "user", content: "tail without a worker" } })}\n`);
+  await historyPeer.handlers.message_end({ message: { role: "user", content: [] } }, historyPeer.ctx);
+  await historyPeer.handlers.session_shutdown({}, historyPeer.ctx);
+  assert.equal(sidecarRow("SELECT COUNT(*) AS count FROM entries").count, 6001, "history is still indexed when the worker is unavailable");
+  assert.equal(sidecarRow("SELECT text FROM entries WHERE entry_id = 'hl-tail'").text, "tail without a worker");
+  delete process.env.PI_SESSION_HISTORY_WORKER;
 
   // The merge helper used by that path keeps the record that progressed further,
   // so a stale copy cannot undo a delivered or read marker.
@@ -683,12 +724,78 @@ try {
   await flaky.handlers.session_shutdown({}, flaky.ctx);
   await foxtrot.handlers.session_shutdown({}, foxtrot.ctx);
   await manual.handlers.session_shutdown({}, manual.ctx);
-  await churn.handlers.session_shutdown({}, churn.ctx);
   await echo.handlers.session_shutdown({}, echo.ctx);
   await golf.handlers.session_shutdown({}, golf.ctx);
   await hotel.handlers.session_shutdown({}, hotel.ctx);
   await india.handlers.session_shutdown({}, india.ctx);
   await juliet.handlers.session_shutdown({}, juliet.ctx);
+
+  // Cost discipline, not only correctness. Every read path used to rewrite the
+  // shared file - a pulse burst, a turn start, a presence tick - and each
+  // rewrite is a read, parse, prune and rename of a file that every Pi process
+  // on the node is also touching, paid inside the session.
+  //
+  // Two things make this measurement mean something: every other peer has already
+  // shut down, so no one else's presence or inbox clock can land inside the
+  // burst; and the burst starts immediately after a genuine write, so this
+  // session's own presence clock is inside the window where a timestamp-only
+  // rewrite is suppressed. Idle sessions are *expected* to rewrite their record
+  // on the presence clock - that is what keeps them advertised - so a measurement
+  // overlapping a tick would be measuring liveness, not churn.
+  const churn = makePeer("17171717-1111-2222-3333-444444444444", "churn", true, "/tmp/project-churn");
+  await churn.handlers.session_start({}, churn.ctx);
+  await call(churn, { action: "pulse" });
+  const settledInode = statSync(statePath).ino;
+  for (let index = 0; index < 12; index++) await call(churn, { action: "pulse" });
+  assert.equal(statSync(statePath).ino, settledInode, "a burst of pulse calls does not rewrite the shared state");
+  await call(churn, { action: "focus", text: "measuring write churn" });
+  assert.notEqual(statSync(statePath).ino, settledInode, "something a teammate could act on is written at once");
+  const churnRecord = JSON.parse(readFileSync(statePath, "utf8")).sessions.find((session) => session.id === churn.ctx.sessionManager.getSessionId());
+  assert.equal(churnRecord.focus, "measuring write churn", "the coalesced writer still lands a focus change");
+
+  // The gate suppresses redundant rewrites, not liveness: a live idle session
+  // still has to advertise itself, or peers keep showing a session that is there
+  // but silent. The harness presence clock is 500ms, so one tick must land.
+  const advertisedBefore = JSON.parse(readFileSync(statePath, "utf8")).sessions
+    .find((session) => session.id === churn.ctx.sessionManager.getSessionId()).lastSeenAt;
+  let advertisedAfter = advertisedBefore;
+  for (let attempt = 0; attempt < 40 && advertisedAfter === advertisedBefore; attempt++) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+    advertisedAfter = JSON.parse(readFileSync(statePath, "utf8")).sessions
+      .find((session) => session.id === churn.ctx.sessionManager.getSessionId()).lastSeenAt;
+  }
+  assert.notEqual(advertisedAfter, advertisedBefore, "an idle session still advertises itself on the presence clock");
+
+  // A turn start used to be three operations on the file: register the session,
+  // read the whole room to render the pulse, then write again to stamp the
+  // pulse. One write has to carry all of it now.
+  const promptStart = await churn.handlers.before_agent_start(
+    { systemPrompt: "BASE", messageType: "user", prompt: "fix /tmp/project-churn/src/auth.ts" },
+    churn.ctx,
+  );
+  assert.match(promptStart.systemPrompt, /^BASE/, "the pulse is still injected into the system prompt");
+  const promptedRecord = JSON.parse(readFileSync(statePath, "utf8")).sessions.find((session) => session.id === churn.ctx.sessionManager.getSessionId());
+  assert.equal(promptedRecord.status, "working", "the turn start still registers the session as working");
+  assert.ok(promptedRecord.lastPulseAt, "the pulse stamp lands in the same write as the record");
+  assert.deepEqual(promptedRecord.recentPaths, ["/tmp/project-churn/src/auth.ts"], "the record carries the paths the prompt mentioned");
+
+  // Cheap reads are only allowed while they stay correct: a peer's write must
+  // still reach this session's next render, or the room quietly stops sharing.
+  // Written straight into the file, which is exactly what a peer's write looks
+  // like from here.
+  const roomWrittenByPeer = JSON.parse(readFileSync(statePath, "utf8"));
+  roomWrittenByPeer.updates = [...roomWrittenByPeer.updates, {
+    id: "00000000-0000-4000-8000-000000000009",
+    sessionId: "another-node-session",
+    sessionName: "another node",
+    project: "/tmp/project-elsewhere",
+    text: "an update written after the read cache was warm",
+    createdAt: new Date().toISOString(),
+  }];
+  await writeFile(statePath, JSON.stringify(roomWrittenByPeer, null, 2));
+  assert.match(await call(churn, { action: "pulse" }), /read cache was warm/, "a cached read is invalidated when a peer writes the room");
+  await churn.handlers.session_shutdown({}, churn.ctx);
+
   // Let any heartbeat callbacks already in flight finish before removing the
   // temporary state directory.
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
