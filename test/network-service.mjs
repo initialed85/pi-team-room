@@ -5,6 +5,9 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { resolveLimits } from "../state-rules.mjs";
+
+const MESSAGE_TEXT_BUDGET = resolveLimits().maxMessageChars;
 
 const servicePath = fileURLToPath(new URL("../network-service.mjs", import.meta.url));
 const secret = "test-only-shared-secret";
@@ -162,7 +165,9 @@ try {
     fromName: "flood",
     toSessionId: "left-session",
     text: `${"y".repeat(4_990)}${String(index).padStart(10, "0")}`,
-    createdAt: new Date(Date.parse("2026-01-01T00:00:00Z") + index * 1_000).toISOString(),
+    // Recent on purpose: retention prunes stale coordination traffic, so a
+    // budget test has to flood with messages the pruning rules consider live.
+    createdAt: new Date(Date.now() - (60 - index) * 1_000).toISOString(),
   }));
   const flooded = await request(leftEndpoint, "/v1/state", {
     method: "POST",
@@ -172,7 +177,7 @@ try {
   assert.equal(flooded.status, 200, "oversized message flood is accepted, not rejected");
   const floodState = (await flooded.json()).state;
   const storedChars = floodState.messages.reduce((sum, item) => sum + item.text.length, 0);
-  assert.ok(storedChars <= 200_000, `stored message text stays under budget (${storedChars})`);
+  assert.ok(storedChars <= MESSAGE_TEXT_BUDGET, `stored message text stays under budget (${storedChars})`);
   assert.ok(floodState.messages.some((item) => item.id === "flood-059"), "newest long message survives the budget");
   assert.ok(!floodState.messages.some((item) => item.id === "flood-000"), "oldest long messages are dropped first");
 
@@ -188,7 +193,16 @@ try {
   console.log("network service integration harness: PASS");
 } finally {
   for (const child of children) {
-    if (!child.killed && child.exitCode === null) child.kill("SIGTERM");
+    // Some sandboxes refuse to signal a child process. Cleanup must not throw
+    // here: an exception in this finally replaces whatever real assertion just
+    // failed, which turns a genuine test failure into a confusing EACCES.
+    if (!child.killed && child.exitCode === null) {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        child.unref();
+      }
+    }
   }
   await Promise.all(children.map((child) => new Promise((resolvePromise) => {
     if (child.exitCode !== null) return resolvePromise();

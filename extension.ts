@@ -4,6 +4,7 @@ import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promis
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { syncSessionDatabase } from "./session-history.mjs";
+import { pruneState, resolveLimits, serializeState } from "./state-rules.mjs";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text, type TUI } from "@earendil-works/pi-tui";
 import { type TObject, type TSchema, type Static, Type } from "typebox";
@@ -23,11 +24,11 @@ const MAX_PULSE_MESSAGE_LENGTH = 400;
 const MAX_CONFIRMATION_LENGTH = 300;
 const MAX_PULSE_ITEMS = 8;
 const MAX_HISTORY_ITEMS = 20;
-const MAX_MESSAGES_PER_SESSION = 50;
-const MAX_SESSIONS = 100;
-const MAX_UPDATES = 100;
-const MAX_JOURNAL = 500;
-const MAX_STORED_MESSAGE_CHARS = 200_000;
+// Record caps and retention windows live in state-rules.mjs so the Pi side and
+// the network service prune to exactly the same shape. Size is not a detail
+// here: every presence tick, turn start, and inbox poll reads and rewrites this
+// file inside the session, so an unbounded file is an unbounded per-turn cost.
+const LIMITS = resolveLimits();
 const HEARTBEAT_MS = Number(process.env.PI_TEAM_ROOM_HEARTBEAT_MS) || 15_000;
 // Direct teammate messages are polled on a much faster clock than presence.
 // Presence pings rewrite the shared session records and only need to look
@@ -215,20 +216,6 @@ function confirmationPreview(text: string): string {
   return preview.length === text.length ? preview : `${preview} … (${text.length} characters sent in full)`;
 }
 
-// Keep the shared state file bounded even with long briefs: drop the oldest
-// messages until stored text falls back under the budget.
-function trimMessages(state: TeamRoomState): void {
-  state.messages = state.messages.slice(-MAX_SESSIONS * MAX_MESSAGES_PER_SESSION);
-  let total = state.messages.reduce((sum, message) => sum + message.text.length, 0);
-  if (total <= MAX_STORED_MESSAGE_CHARS) return;
-  let dropped = 0;
-  while (dropped < state.messages.length && total > MAX_STORED_MESSAGE_CHARS) {
-    total -= state.messages[dropped].text.length;
-    dropped += 1;
-  }
-  state.messages = state.messages.slice(dropped);
-}
-
 function projectLabel(project: string): string {
   const home = process.env.HOME;
   if (home && (project === home || project.startsWith(`${home}/`))) return `~${project.slice(home.length)}`;
@@ -238,6 +225,11 @@ function projectLabel(project: string): string {
 function statePath(): string {
   return process.env[STATE_ENV] || DEFAULT_STATE_PATH;
 }
+
+// Session ids owned by this process. Kept at module scope because the state
+// transaction helpers live outside the extension activation closure, and pruning
+// needs to know which records belong to a session that is still alive here.
+const protectedSessionIds = new Set<string>();
 
 function startNetworkService(): void {
   if (!NETWORK_ENABLED || !process.env.PI_TEAM_ROOM_SHARED_SECRET) return;
@@ -280,7 +272,7 @@ async function saveState(state: TeamRoomState): Promise<void> {
   const path = statePath();
   await mkdir(dirname(path), { recursive: true });
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  await writeFile(temp, serializeState(state), { mode: 0o600 });
   await rename(temp, path);
 }
 
@@ -324,20 +316,22 @@ export function mergeById<T extends MergeableRecord>(left: T[], right: T[], limi
   return [...merged.values()].sort((a, b) => recordTime(a) - recordTime(b)).slice(-limit);
 }
 
-// Saving merges into the file rather than replacing it. Under the lock the two
-// views agree, so this is a no-op; it is the guard that stops a future unlocked
-// writer (or a retried transaction) from dropping a teammate's record.
-async function saveMergedState(state: TeamRoomState): Promise<void> {
+// Saving merges into the file rather than replacing it, then prunes the result.
+// Under the lock the two views agree, so the merge is a no-op; it is the guard
+// that stops a future unlocked writer (or a retried transaction) from dropping a
+// teammate's record. Pruning on write (rather than on read) means the file on
+// disk is always the bounded version, and a stale record a sleeping peer
+// re-imports is dropped again by the next write on every node that dropped it.
+async function saveMergedState(state: TeamRoomState, keepSessionIds: string[] = []): Promise<void> {
   const current = await loadState();
   const merged: TeamRoomState = {
     version: 1,
-    sessions: mergeById(current.sessions, state.sessions, MAX_SESSIONS),
-    messages: mergeById(current.messages, state.messages, MAX_SESSIONS * MAX_MESSAGES_PER_SESSION),
-    updates: mergeById(current.updates, state.updates, MAX_UPDATES),
-    journal: mergeById(current.journal, state.journal, MAX_JOURNAL),
+    sessions: mergeById(current.sessions, state.sessions, LIMITS.maxSessions),
+    messages: mergeById(current.messages, state.messages, LIMITS.maxMessages),
+    updates: mergeById(current.updates, state.updates, LIMITS.maxUpdates),
+    journal: mergeById(current.journal, state.journal, LIMITS.maxJournalItems),
   };
-  trimMessages(merged);
-  await saveState(merged);
+  await saveState(pruneState(merged, { keepSessionIds }).state);
 }
 
 async function withState<T>(fn: (state: TeamRoomState) => T | Promise<T>): Promise<T> {
@@ -376,7 +370,11 @@ async function withState<T>(fn: (state: TeamRoomState) => T | Promise<T>): Promi
 async function updateState<T>(fn: (state: TeamRoomState) => T | Promise<T>): Promise<T> {
   return withState(async (state) => {
     const result = await fn(state);
-    await saveMergedState(state);
+    // Pruning must never eat the record of a session that is still writing:
+    // presence heartbeats make a live record look fresh, but a session that has
+    // been idle longer than the retention window would otherwise prune itself
+    // out of the room and stop being addressable by peers.
+    await saveMergedState(state, [...protectedSessionIds]);
     return result;
   });
 }
@@ -446,7 +444,9 @@ function relevantUpdates(state: TeamRoomState, current: WorkSession): TeamUpdate
 }
 
 function recentJournal(state: TeamRoomState, _current: WorkSession): JournalItem[] {
-  return state.journal
+  // Copy before sorting: this runs against snapshots that may be cached for
+  // cheap reads, and an in-place sort would reorder a shared record list.
+  return [...state.journal]
     .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
     .slice(0, 3);
 }
@@ -724,8 +724,9 @@ export default function (pi: ExtensionAPI) {
       recentPaths: existing?.recentPaths || [],
     };
     current = next;
+    protectedSessionIds.add(id);
     await updateState((state) => {
-      state.sessions = [next, ...state.sessions.filter((item) => item.id !== id)].slice(0, MAX_SESSIONS);
+      state.sessions = [next, ...state.sessions.filter((item) => item.id !== id)].slice(0, LIMITS.maxSessions);
     });
     return next;
   }
@@ -1264,7 +1265,7 @@ export default function (pi: ExtensionAPI) {
       const previous = state.updates.find((item) => item.sessionId === current!.id && item.text === clean);
       if (previous && Date.now() - Date.parse(previous.createdAt) < 10 * 60 * 1000) return "Already shared recently.";
       state.updates.unshift({ id: randomUUID(), sessionId: current!.id, sessionName: current!.name, project: current!.project, text: clean, createdAt: now() });
-      state.updates = state.updates.slice(0, MAX_UPDATES);
+      state.updates = state.updates.slice(0, LIMITS.maxUpdates);
       return `Shared with the team: ${clean}`;
     });
   }
@@ -1307,7 +1308,6 @@ export default function (pi: ExtensionAPI) {
       if (delegation) message.delegation = delegation;
       if (delivery !== "auto") message.delivery = delivery;
       state.messages.push(message);
-      trimMessages(state);
       const focus = target.focus || target.checkpoint?.text || "no focus recorded";
       const recommendation = target.status === "working" ? "followUp" : "steer";
       const selected = delivery === "auto" ? `${recommendation} (auto)` : delivery;
@@ -1366,7 +1366,6 @@ export default function (pi: ExtensionAPI) {
       };
       if (delivery !== "auto") message.delivery = delivery;
       state.messages.push(message);
-      trimMessages(state);
       const targetStatus = target?.status || "unknown";
       const targetFocus = target?.focus || target?.checkpoint?.text || "focus unavailable";
       const recommendation = target?.status === "working" ? "followUp" : "steer";
@@ -1450,6 +1449,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    // This process is finishing with its session record, so it stops protecting
+    // it: the record stays visible for the retention window as a resume point,
+    // then pruning is allowed to drop it like any other dead session.
+    if (current) protectedSessionIds.delete(current.id);
     await flushSessionHistory(ctx);
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = undefined;
@@ -1536,7 +1539,7 @@ export default function (pi: ExtensionAPI) {
           if (!clean) return toolResult("remember", "A fact or decision is required.");
           await updateState((state) => {
             state.journal.unshift({ id: randomUUID(), project: session.project, text: clean, createdAt: now(), sessionName: session.name });
-            state.journal = state.journal.slice(0, MAX_JOURNAL);
+            state.journal = state.journal.slice(0, LIMITS.maxJournalItems);
           });
           return toolResult("remember", `Saved to shared history: ${clean}`);
         }
@@ -1608,7 +1611,7 @@ export default function (pi: ExtensionAPI) {
           if (!clean) throw new Error("Usage: /team remember <fact or decision>");
           await updateState((state) => {
             state.journal.unshift({ id: randomUUID(), project: session.project, text: clean, createdAt: now(), sessionName: session.name });
-            state.journal = state.journal.slice(0, MAX_JOURNAL);
+            state.journal = state.journal.slice(0, LIMITS.maxJournalItems);
           });
           ctx.ui.notify(`Saved to shared history: ${clean}`, "info");
         } else if (subcommand === "history") {

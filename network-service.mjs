@@ -3,6 +3,7 @@ import { hostname, networkInterfaces } from "node:os";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { pruneState, resolveLimits, serializeState } from "./state-rules.mjs";
 
 const PROTOCOL_VERSION = 1;
 const SERVICE_TYPE = "pi-team-room";
@@ -14,13 +15,11 @@ const SYNC_MS = Number(process.env.PI_TEAM_ROOM_SYNC_MS) || 5_000;
 const LEASE_GRACE_MS = Number(process.env.PI_TEAM_ROOM_NODE_GRACE_MS) || 120_000;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const STALE_SESSION_MS = 90_000;
-const MAX_SESSIONS = 100;
-const MAX_MESSAGES = 5_000;
-const MAX_UPDATES = 100;
-const MAX_JOURNAL = 500;
-// Longer teammate briefs must not turn a state snapshot into a multi-megabyte
-// payload: bound stored message text the same way the extension does locally.
-const MAX_STORED_MESSAGE_CHARS = 200_000;
+// Record caps and retention windows come from the same module the Pi side uses.
+// Both writers must prune identically, because this service POSTs whole state
+// snapshots to peers: a record one node dropped would otherwise be re-imported
+// by the next peer's snapshot and circulate indefinitely.
+const LIMITS = resolveLimits();
 const NETWORK_ENABLED = process.env.PI_TEAM_ROOM_NETWORK === "1";
 const MDNS_ENABLED = process.env.PI_TEAM_ROOM_MDNS !== "0";
 
@@ -58,26 +57,12 @@ function validState(value) {
     Array.isArray(candidate.updates) && Array.isArray(candidate.journal);
 }
 
-function budgetedMessages(messages) {
-  let total = messages.reduce((sum, message) => sum + String(message.text ?? "").length, 0);
-  if (total <= MAX_STORED_MESSAGE_CHARS) return messages;
-  let dropped = 0;
-  while (dropped < messages.length && total > MAX_STORED_MESSAGE_CHARS) {
-    total -= String(messages[dropped].text ?? "").length;
-    dropped += 1;
-  }
-  return messages.slice(dropped);
-}
-
 function cleanState(value) {
   if (!validState(value)) return emptyState();
-  return {
-    version: 1,
-    sessions: value.sessions.filter((item) => item && typeof item === "object" && typeof item.id === "string").slice(-MAX_SESSIONS),
-    messages: budgetedMessages(value.messages.filter((item) => item && typeof item === "object" && typeof item.id === "string").slice(-MAX_MESSAGES)),
-    updates: value.updates.filter((item) => item && typeof item === "object" && typeof item.id === "string").slice(-MAX_UPDATES),
-    journal: value.journal.filter((item) => item && typeof item === "object" && typeof item.id === "string").slice(-MAX_JOURNAL),
-  };
+  // Prune at ingest: a peer that has been asleep for a week must not be able to
+  // hand this node its accumulated stale records, and every node applies the
+  // same retention rules the Pi side applies on its own writes.
+  return pruneState(value, { limits: LIMITS }).state;
 }
 
 async function loadState() {
@@ -92,7 +77,7 @@ async function saveState(state) {
   const path = STATE_PATH;
   await mkdir(dirname(path), { recursive: true });
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  await writeFile(temp, serializeState(state), { mode: 0o600 });
   await rename(temp, path);
 }
 
@@ -152,17 +137,17 @@ function mergeSessions(left, right) {
   }
   return [...records.values()]
     .sort((a, b) => timestamp(a.updatedAt) - timestamp(b.updatedAt))
-    .slice(-MAX_SESSIONS);
+    .slice(-LIMITS.maxSessions);
 }
 
 function mergeStates(left, right) {
-  return {
+  return pruneState({
     version: 1,
     sessions: mergeSessions(left.sessions, right.sessions),
-    messages: budgetedMessages(mergeById(left.messages, right.messages, MAX_MESSAGES)),
-    updates: mergeById(left.updates, right.updates, MAX_UPDATES),
-    journal: mergeById(left.journal, right.journal, MAX_JOURNAL),
-  };
+    messages: mergeById(left.messages, right.messages, LIMITS.maxMessages),
+    updates: mergeById(left.updates, right.updates, LIMITS.maxUpdates),
+    journal: mergeById(left.journal, right.journal, LIMITS.maxJournalItems),
+  }, { limits: LIMITS }).state;
 }
 
 function sameState(left, right) {
