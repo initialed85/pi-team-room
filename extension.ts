@@ -63,6 +63,16 @@ const AUTO_CHECKPOINT_MIN_MS = (() => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
 })();
 const HISTORY_ENABLED = process.env.PI_SESSION_HISTORY !== "0";
+// Undirected broadcast is the room pushing what everybody is up to at every peer:
+// peer focus, published updates, and the shared journal are folded into each
+// turn's system prompt. That ambient chatter is what makes parallel agents react
+// to each other instead of their own task, so it is off unless a session opts in
+// with PI_TEAM_ROOM_BROADCAST=1. Directed coordination (ask/delegate/reply),
+// explicit pulls (pulse/inbox/history), and this session's own checkpoint are
+// unaffected: the flag controls the push, not the room.
+function broadcastsEnabled(): boolean {
+  return process.env.PI_TEAM_ROOM_BROADCAST === "1";
+}
 const WIDGET_ID = "team-room";
 const SUMMARY_TYPE = "pi-team-room-summary";
 const DONE_SIGNAL = "🐈";
@@ -532,7 +542,12 @@ function delegationDeliveryText(message: TeamMessage): string {
   return lines.join("\n");
 }
 
-function renderPulse(state: TeamRoomState, current: WorkSession): string {
+// The pulse has two audiences. A model asking for it (action=pulse, /team summary)
+// wants the whole room, including the undirected broadcast. The pulse injected at
+// a turn start is a push, and while broadcasts are off it must carry only what
+// this session can act on: who is reachable and its own unread messages.
+function renderPulse(state: TeamRoomState, current: WorkSession, options: { includeBroadcasts?: boolean } = {}): string {
+  const includeBroadcasts = options.includeBroadcasts !== false;
   const sessions = activeSessions(state, current);
   const updates = relevantUpdates(state, current);
   const messages = unreadMessages(state, current);
@@ -543,11 +558,12 @@ function renderPulse(state: TeamRoomState, current: WorkSession): string {
   } else {
     for (const peer of peers.slice(0, 5)) {
       const focus = peer.focus || peer.checkpoint?.text || "no focus recorded";
-      lines.push(`- ${peer.name} [${shortId(peer.id)}] (${peer.status}, ${projectLabel(peer.project)}): ${truncate(focus, 150)}`);
+      const headline = includeBroadcasts ? `: ${truncate(focus, 150)}` : "";
+      lines.push(`- ${peer.name} [${shortId(peer.id)}] (${peer.status}, ${projectLabel(peer.project)})${headline}`);
     }
   }
 
-  if (updates.length > 0) {
+  if (updates.length > 0 && includeBroadcasts) {
     lines.push("", current.lastPulseAt ? "Since you were last here:" : "Recent teammate updates:");
     for (const update of updates.slice(0, 4)) lines.push(`- ${update.sessionName}: ${update.text}`);
   }
@@ -559,9 +575,12 @@ function renderPulse(state: TeamRoomState, current: WorkSession): string {
     if (messages.length > 4) lines.push(`- … and ${messages.length - 4} more; use team_room action=inbox.`);
   }
   const journal = recentJournal(state, current);
-  if (journal.length > 0) {
+  if (journal.length > 0 && includeBroadcasts) {
     lines.push("", "Recent shared decisions/history:");
     for (const item of journal) lines.push(`- ${item.sessionName} [${projectLabel(item.project)}]: ${item.text}`);
+  }
+  if (!includeBroadcasts) {
+    lines.push("", "- Undirected broadcasts are off (PI_TEAM_ROOM_BROADCAST=0): peer focus, published updates, and the shared journal are not pushed. Pull them with action=pulse, the inbox, or action=history when you actually need them.");
   }
   return lines.join("\n");
 }
@@ -1467,6 +1486,9 @@ export default function (pi: ExtensionAPI) {
 
   async function publishUpdate(text: string): Promise<string> {
     if (!current) throw new Error("Team room session is not ready");
+    // Refuse rather than silently park the text where no peer will read it: the
+    // sender should learn that this room does not do undirected broadcast.
+    if (!broadcastsEnabled()) return "Broadcasts are off (set PI_TEAM_ROOM_BROADCAST=1 to enable); use action=ask, action=delegate, or action=checkpoint for context that has a specific reader.";
     const clean = truncate(text, MAX_UPDATE_LENGTH);
     if (!clean) throw new Error("Update cannot be empty");
     return updateState((state) => {
@@ -1645,15 +1667,23 @@ export default function (pi: ExtensionAPI) {
     // the pulse render, then a stamp write for the pulse itself. The paths the
     // prompt mentioned are folded into the same record, and the pulse render
     // goes through the cached read.
-    const pulseAt = now();
+    const broadcasts = broadcastsEnabled();
+    // With broadcasts off the injected pulse does not carry updates, so it must
+    // not advance the "since you were last here" stamp either: stamping here
+    // would silently swallow updates published by sessions that do opt in before
+    // this one gets around to pulling them.
+    const pulseAt = broadcasts ? now() : undefined;
     const paths = mentionedPaths(event.messageType === "user" ? event.prompt : undefined);
     const session = await ensureSession(ctx, "working", { paths, pulseAt });
-    const pulse = renderPulse(await readState(), session);
+    const pulse = renderPulse(await readState(), session, { includeBroadcasts: broadcasts });
     const checkpoint = session.checkpoint ? `\n\nYour current checkpoint:\n- ${session.checkpoint.text}` : "";
+    const roomUse = broadcasts
+      ? "Use team_room only for meaningful updates, questions, replies, checkpoints, decisions, or relevant history. Do not narrate routine file edits or test runs."
+      : "Undirected broadcasts are off here: do not publish updates or expect peer focus to arrive on its own. Use team_room only for directed questions, replies, and delegations, for your own checkpoint, or for history you deliberately pull. Do not narrate routine file edits or test runs.";
     return {
       // Use the system prompt rather than a persistent custom message: the
       // pulse is ambient state for this turn, not another transcript entry.
-      systemPrompt: `${event.systemPrompt}\n\n## Shared team room\n${pulse}${checkpoint}\n\n${TEAM_ROOM_PROTOCOL} Use team_room only for meaningful updates, questions, replies, checkpoints, decisions, or relevant history. Do not narrate routine file edits or test runs.`,
+      systemPrompt: `${event.systemPrompt}\n\n## Shared team room\n${pulse}${checkpoint}\n\n${TEAM_ROOM_PROTOCOL} ${roomUse}`,
     };
   });
 
@@ -1694,11 +1724,15 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "team_room",
     label: "Team Room",
-    description: "Quiet peer context: inspect the team pulse, publish meaningful updates, ask a peer a question, delegate a scoped task to an online code owner, save a task checkpoint, or search shared work history. Do not use for routine activity narration.",
+    description: broadcastsEnabled()
+      ? "Quiet peer context: inspect the team pulse, publish meaningful updates, ask a peer a question, delegate a scoped task to an online code owner, save a task checkpoint, or search shared work history. Do not use for routine activity narration."
+      : "Directed peer context: inspect the team pulse on request, ask a peer a question, delegate a scoped task to an online code owner, save a task checkpoint, or search shared work history. Undirected updates are disabled. Do not use for routine activity narration.",
     promptSnippet: "Share and retrieve concise context with peer Pi sessions",
     promptGuidelines: [
       "Use team_room action=pulse when orienting yourself to relevant parallel work.",
-      "Use team_room action=update for meaningful decisions, discoveries, blockers, or completion notes—not individual tool calls.",
+      broadcastsEnabled()
+        ? "Use team_room action=update for meaningful decisions, discoveries, blockers, or completion notes—not individual tool calls."
+        : "Do not call action=update: undirected broadcasts are off in this room. Use ask/delegate for a peer who needs the context.",
       "Use team_room action=checkpoint when pausing work or recording a useful resume point.",
       "Use team_room action=ask when another active peer has relevant context you need.",
       "Use team_room action=delegate when an online peer owns the target repository/component. Provide target, scope, acceptanceChecks, and expectedArtifact; the owner implements/tests/commits/pushes while you coordinate integration or rollout. If the owner is offline, state any fallback explicitly and ensure current user authorization covers taking over.",

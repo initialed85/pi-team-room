@@ -358,6 +358,7 @@ var roomVocabulary = []roomPhrase{
 	{"No active peer named or identified by ", "rejected", "no such peer is in the room", true},
 	{"That message is a terminal ", "rejected", "tried to reply to a terminal acknowledgement", false},
 	{"Already shared recently", "rejected", "the room already had that update", false},
+	{"Broadcasts are off", "rejected", "undirected broadcasts are disabled in this room", false},
 	{"Delegation requires an agent and task", "rejected", "delegation called without an agent or task", false},
 	{"Delegation requires target and scope", "rejected", "delegation called without target or scope", false},
 	{"Ask requires an agent name and question", "rejected", "ask called without a name or question", false},

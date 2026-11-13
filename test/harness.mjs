@@ -12,6 +12,10 @@ const statePath = join(stateDir, "state.json");
 process.env.PI_TEAM_ROOM_STATE = statePath;
 process.env.PI_TEAM_ROOM_INBOX_MS = "200";
 process.env.PI_TEAM_ROOM_WAKE = "1";
+// Undirected broadcast is off unless a session opts in, which is what production
+// gets. The harness opts in for the shared-room tests and switches it off
+// explicitly below to check the push/pull split.
+process.env.PI_TEAM_ROOM_BROADCAST = "1";
 // The production wake gap keeps a peer from being interrupted in a loop, and the
 // harness runs in about a second, so it needs a faster clock.
 process.env.PI_TEAM_ROOM_WAKE_MIN_GAP_MS = "10";
@@ -268,6 +272,19 @@ try {
   assert.match(pulse, /alpha/);
   assert.match(pulse, /project-alpha/);
   assert.match(pulse, /flaky test/);
+
+  // Broadcast off is the default: the room still pulls on request, but a turn
+  // start must not push a peer's focus or updates into somebody else's prompt,
+  // and publishing an update is refused instead of parked where nobody reads it.
+  delete process.env.PI_TEAM_ROOM_BROADCAST;
+  assert.match(await call(alpha, { action: "update", text: "should not broadcast" }), /Broadcasts are off/);
+  assert.match(await call(bravo, { action: "pulse" }), /flaky test/, "an explicit pulse still pulls the room");
+  const quietStart = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
+  assert.ok(!quietStart.systemPrompt.includes("flaky test"), "a peer update is not pushed into a turn start");
+  assert.ok(!quietStart.systemPrompt.includes("auth refactor"), "a peer focus is not pushed into a turn start");
+  assert.match(quietStart.systemPrompt, /Undirected broadcasts are off/);
+  assert.match(await call(bravo, { action: "pulse" }), /flaky test/, "a quiet turn start does not swallow the update for later pulls");
+  process.env.PI_TEAM_ROOM_BROADCAST = "1";
 
   assert.match(await call(bravo, { action: "ask", agent: "alpha", text: "which test is flaky?" }), /Question sent/);
   const injected = await alpha.handlers.before_agent_start({ systemPrompt: "BASE" }, alpha.ctx);

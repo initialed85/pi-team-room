@@ -159,6 +159,24 @@ It exists because the room's failures are invisible in a transcript. A refused c
 
 Its tests are hermetic, which is what lets `.woodpecker/viewer.yaml` run them without any transcript in the repo: each test builds its own room in a `t.TempDir`. One of them is a contract with this extension, so a new refusal sentence in `extension.ts` has to be recognised by the viewer or the lane goes red. Transcripts and rendered output are gitignored.
 
+## Undirected broadcast (opt-in, off by default)
+
+The room can push what everybody is up to at every peer: a session's focus (which Pi infers from the
+latest user prompt), published `update`s, and the shared journal are folded into each turn's system
+prompt. That ambient chatter is one of the ways parallel agents end up reacting to each other's work
+instead of their own task, so **the push is off by default**.
+
+While it is off:
+
+- A turn start still shows who else is reachable (name, session id, status, project) and this
+  session's own unread messages and checkpoint, but not peers' focus, updates, or the journal.
+- `update` is refused with a short sentence instead of being written where nobody will read it.
+  `ask`, `delegate`, `reply`, `checkpoint`, `remember`, and `history` keep working.
+- Pulling is unchanged: `team_room action=pulse`, `/team summary`, `inbox`, and `history` return
+  the whole room, including focus, updates, and journal, because the agent asked for it.
+
+Set `PI_TEAM_ROOM_BROADCAST=1` per session to restore the old ambient push.
+
 ## Auto checkpoints
 
 When a session shuts down, if it was meaningfully active but never saved an explicit `checkpoint`, the extension leaves an automatic breadcrumb derived from its focus/latest prompt and prefixed `[auto]`. This means even a forgotten session leaves a resume point for teammates — but only as a fallback: explicit checkpoints always win, and sessions that have not been active for at least `PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS` create nothing.
@@ -198,7 +216,7 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 - Presence is ephemeral-ish: stale sessions are hidden from the pulse after 30 minutes, but their last checkpoint and history remain.
 - Updates are capped and deduplicated to avoid turning the team room into a tool-call transcript.
 - Text budgets are split by role. One-line surfaces (status updates, journal facts, pulse lines, send confirmations) are capped and flattened: 500 characters for an update, 2,000 for a checkpoint, 400 per pulse message line, 300 for a confirmation preview. Direct teammate messages and delegation briefs are stored as prose with their paragraph breaks and get their own budgets: 6,000 characters of message text and 3,000 per delegation field. A pulse or confirmation line is a preview that says how long the full message was; `inbox` and wakes always carry the whole brief. - Shared state additionally holds at most 100,000 characters of stored message text, dropping the oldest messages first, and the whole file is capped at 150,000 serialized characters (see the retention knobs below) so a Pi's per-turn cost stays bounded however the room is configured.
-- The pulse is injected into the current turn's system prompt, so it does not create persistent transcript clutter.
+- The pulse is injected into the current turn's system prompt, so it does not create persistent transcript clutter. What that injected pulse contains is governed by `PI_TEAM_ROOM_BROADCAST`: undirected broadcast (peer focus, updates, journal) is off unless a session opts in, while an explicit `pulse`/`inbox`/`history` call always reads the whole room.
 - Senders get a current-but-advisory peer status/focus snapshot when asking; auto delivery is resolved again by the recipient at delivery time because status can change between the two.
 - Each session gets a durable session id, allowing messages to target a specific peer even when display names repeat.
 - The extension reads and writes the state atomically enough for local peer processes using a lock file and rename-based writes.
@@ -227,6 +245,7 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 | `PI_TEAM_ROOM_MAX_MESSAGE_CHARS` | `100000` | Stored direct-message text budget |
 | `PI_TEAM_ROOM_MAX_JOURNAL` / `PI_TEAM_ROOM_MAX_JOURNAL_CHARS` | `200` / `60000` | Journal record and text budgets |
 | `PI_TEAM_ROOM_MAX_SESSIONS` / `PI_TEAM_ROOM_MAX_MESSAGES` / `PI_TEAM_ROOM_MAX_UPDATES` | `100` / `5000` / `60` | Record-count ceilings |
+| `PI_TEAM_ROOM_BROADCAST` | `0` | Push undirected broadcast (peer focus, updates, journal) into each turn's prompt; `1` enables it. Directed messages and explicit pulls are unaffected |
 | `PI_TEAM_ROOM_WAKE` | `1` | Allow automatic direct-message delivery and wake/queue behavior (`0` disables) |
 | `PI_TEAM_ROOM_INBOX_MS` | `1000` | Direct-message poll period (independent of the presence clock) |
 | `PI_TEAM_ROOM_WAKE_MIN_GAP_MS` | `1000` | Minimum gap between automatic wake turns; queued messages coalesce into one |

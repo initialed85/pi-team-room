@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+- Undirected broadcast is now opt-in. Peer focus (which Pi infers from the latest user prompt),
+  published `update`s, and the shared journal had been folded into every session's turn-start system
+  prompt, which made parallel agents react to each other's work instead of their own. That push is
+  off unless a session sets `PI_TEAM_ROOM_BROADCAST=1`. Directed coordination (`ask`/`delegate`/
+  `reply`), this session's own checkpoint, and explicit pulls (`team_room action=pulse`, `/team
+  summary`, `inbox`, `history`) are unchanged; a turn start while broadcast is off still lists which
+  peers are reachable and any unread messages.
+- `team_room action=update` is refused while broadcast is off (`Broadcasts are off ...`) instead of
+  writing an update no peer will be shown, and the tool description and prompt guidelines no longer
+  invite ambient updates in that mode. The team-room viewer's vocabulary knows the new refusal.
+- Regression tests cover the default-off push: a turn start carries neither peer focus nor peer
+  updates, an explicit pulse still reads them, and `update` is refused.
+
 ## [0.1.2] — 2026-10-29
 
 Fixes in this release, then the items that had been sitting under Unreleased and are released with it.
