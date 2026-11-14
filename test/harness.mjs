@@ -298,8 +298,11 @@ try {
   assert.equal(alphaAfterPrompt.focus, "auth refactor", "explicit focus survives the next prompt boundary");
 
   const inbox = await call(alpha, { action: "inbox" });
-  const messageId = inbox.match(/\[question ([0-9a-f]{8})\]/)?.[1];
+  // The inbox header carries the sender's owned lane and the thread depth beside
+  // the id, so the id is no longer the only thing inside the brackets.
+  const messageId = inbox.match(/\[question ([0-9a-f]{8})[,\]]/)?.[1];
   assert.ok(messageId, "inbox includes a short message id");
+  assert.match(inbox, /owns: bravo/, "inbox attributes the message to the sender's lane");
   assert.match(await call(alpha, { action: "reply", messageId, text: "the refresh-token test" }), /Reply sent/);
   assert.match(await call(bravo, { action: "inbox" }), /refresh-token test/);
 
@@ -812,6 +815,100 @@ try {
   await writeFile(statePath, JSON.stringify(roomWrittenByPeer, null, 2));
   assert.match(await call(churn, { action: "pulse" }), /read cache was warm/, "a cached read is invalidated when a peer writes the room");
   await churn.handlers.session_shutdown({}, churn.ctx);
+
+  // --- Ownership and the reply-chain brake -------------------------------
+  //
+  // Two agents can turn one finding into an all-night correspondence, because
+  // every individual link is defensible and every link wakes the other side.
+  // These checks cover the two things that stop it: a declared owner whose call
+  // is the tiebreaker, and a depth cap that throttles the wake without ever
+  // dropping the message.
+  const lane = makePeer("dddddddd-1111-2222-3333-444444444444", "life-agent-finance", true, "/tmp/life");
+  const peerLane = makePeer("eeeeeeee-1111-2222-3333-444444444444", "the-boss", true, "/tmp/life");
+  await lane.handlers.session_start({}, lane.ctx);
+  await peerLane.handlers.session_start({}, peerLane.ctx);
+  await call(lane, { action: "focus", text: "the finance lane" });
+  await call(peerLane, { action: "focus", text: "coordinating" });
+
+  // Ownership is derived from the part of the name that is not the project, so
+  // two sessions sharing one checkout still have distinguishable lanes.
+  assert.match(
+    await call(lane, { action: "focus" }),
+    /owns: finance/,
+    "a lane is derived from the session name rather than the shared project",
+  );
+  assert.match(await call(peerLane, { action: "pulse" }), /owns: finance/, "the pulse shows whose call a lane is");
+
+  // A declared lane wins over the derived one.
+  assert.match(
+    await call(lane, { action: "focus", owns: "finance, insurance" }),
+    /tiebreaker/,
+    "declaring ownership reports that the lane is now this session's call",
+  );
+  const declaredLane = JSON.parse(readFileSync(statePath, "utf8")).sessions
+    .find((session) => session.id === lane.ctx.sessionManager.getSessionId());
+  assert.deepEqual(declaredLane.owns, ["finance", "insurance"], "declared ownership is stored on the session record");
+
+  // Walk a thread past both caps. Each round answers the previous reply, so the
+  // depth stamp has to accumulate across alternating senders.
+  assert.match(
+    await call(peerLane, { action: "ask", agent: "life-agent-finance", text: "what does the ledger say?" }),
+    /owns: finance/,
+    "the send confirmation names the recipient's lane",
+  );
+  let pendingId = await waitFor("the opening question to reach the lane", () => {
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    return state.messages.find((message) => message.toSessionId === lane.ctx.sessionManager.getSessionId()
+      && message.kind === "question")?.id;
+  });
+  const rounds = [];
+  const wakesPerRound = [];
+  for (let round = 0; round < 6; round += 1) {
+    const responder = round % 2 === 0 ? lane : peerLane;
+    const recipient = round % 2 === 0 ? peerLane : lane;
+    rounds.push(await call(responder, { action: "reply", messageId: pendingId, text: `round ${round}`, delivery: "steer" }));
+    const recipientId = recipient.ctx.sessionManager.getSessionId();
+    pendingId = await waitFor(`reply ${round} to land`, () => {
+      const state = JSON.parse(readFileSync(statePath, "utf8"));
+      return state.messages.find((message) => message.toSessionId === recipientId && message.text === `round ${round}`)?.id;
+    });
+    // Give the inbox poll the same chance to wake the recipient on every round,
+    // so a missing wake later is the cap and not a race.
+    await waitFor(`round ${round} to be marked delivered`, () => {
+      const state = JSON.parse(readFileSync(statePath, "utf8"));
+      return state.messages.find((message) => message.text === `round ${round}`)?.deliveredAt;
+    });
+    wakesPerRound.push(recipient.sendCalls.filter((entry) => entry.message?.content?.includes(`round ${round}`)).length);
+  }
+
+  const stamped = JSON.parse(readFileSync(statePath, "utf8")).messages
+    .filter((message) => /^round \d$/.test(String(message.text)))
+    .sort((a, b) => a.text.localeCompare(b.text))
+    .map((message) => message.threadDepth);
+  assert.deepEqual(stamped, [1, 2, 3, 4, 5, 6], "each reply is stamped one deeper than the message it answers");
+
+  // Depth 3 is the soft cap: an explicit steer is downgraded, because a thread
+  // this deep has stopped converging and may no longer interrupt a peer.
+  assert.match(rounds[2], /downgraded from steer/, "past the soft depth an explicit steer is downgraded to a follow-up");
+  // Depth 5 is the hard cap: the message is still stored and still visible, but
+  // it no longer buys a turn of the recipient's attention.
+  assert.match(rounds[4], /no wake/, "past the hard depth a reply stops waking the recipient");
+  assert.match(rounds[4], /inbox/, "the sender is told the message is filed rather than delivered");
+  assert.ok(
+    JSON.parse(readFileSync(statePath, "utf8")).messages.some((message) => message.text === "round 5"),
+    "a capped reply is still stored in the room rather than dropped",
+  );
+  assert.match(await call(lane, { action: "inbox" }), /round [45]/, "a capped reply is still readable in the inbox");
+  // The point of the whole exercise: the deep rounds are delivered without ever
+  // costing the recipient a turn.
+  assert.deepEqual(
+    wakesPerRound,
+    [1, 1, 1, 1, 0, 0],
+    "rounds below the hard depth wake the recipient once each, and rounds at or past it never wake it",
+  );
+
+  await lane.handlers.session_shutdown({}, lane.ctx);
+  await peerLane.handlers.session_shutdown({}, peerLane.ctx);
 
   // Let any heartbeat callbacks already in flight finish before removing the
   // temporary state directory.

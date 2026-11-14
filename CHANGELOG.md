@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+- Each session now **owns a lane** and is the tiebreaker inside it. Ownership shows as `owns:` in the
+  pulse, on every send confirmation, and on every delivered message; it defaults to the part of the
+  session name that is not just its project (`life-agent-finance` in `~/Projects/Home/life` owns
+  `finance`) because several sessions routinely share one checkout, and it can be declared with
+  `/team owns <lane>` or `team_room action=focus owns=<lane>`. The protocol says a non-owner accepts
+  an owned result or raises one specific falsifiable defect rather than re-deriving it, so a
+  coordinating session that owns no lane is never the tiebreaker for someone else's.
+- **Reply chains are depth-capped, throttling the wake rather than the message.** Two agents could
+  turn one finding into an all-night correspondence: every link is individually defensible, so no
+  "reply once" rule ever fired, and every link woke the other side. Replies are now stamped one
+  deeper than the message they answer at send time (so the count survives its own ancestors being
+  pruned); at `PI_TEAM_ROOM_THREAD_SOFT_DEPTH` (3) a thread may no longer interrupt and an explicit
+  `steer` is downgraded to a `followUp`, and at `PI_TEAM_ROOM_THREAD_HARD_DEPTH` (5) it stops waking
+  the recipient at all. Nothing is dropped at any depth: a capped reply is still stored, still in the
+  inbox, still in the pulse. The sender is told which of those happened, because a sender that
+  believes it interrupted a peer will otherwise keep sending.
+- A plain **reply to an idle peer is now a `followUp` rather than a `steer`**. A reply continues an
+  exchange the recipient already chose to engage with, so the next round is not a blocker; a question
+  or delegation, which is new work, still steers an idle peer immediately.
+- Prompt rules for the above, the sharpest being **agreement is not news**: a message whose payload is
+  confirmation, reproduction, praise, or a refinement that changes no decision is not worth a turn of
+  someone else's attention. Incoming messages carry `owns:` and `thread: N deep` so the recipient can
+  see whose call it is and whether the exchange has stopped converging.
+- Regression tests cover lane derivation from a shared checkout, declared ownership, depth stamping
+  across alternating senders, the steer downgrade at the soft cap, the no-wake cap, and that a capped
+  reply is still stored and still readable in the inbox.
+
 - Undirected broadcast is now opt-in. Peer focus (which Pi infers from the latest user prompt),
   published `update`s, and the shared journal had been folded into every session's turn-start system
   prompt, which made parallel agents react to each other's work instead of their own. That push is

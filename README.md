@@ -41,6 +41,7 @@ The extension stores shared state in `~/.pi/team-room/state.json` by default. Se
 - `/team` or `/team summary` — show the current machine-wide team pulse; also drops a durable TUI summary card (rendered as a colored entry, not sent to the LLM)
 - `/team expand` / `/team compact` — expand or collapse the live team widget
 - `/team focus [text]` — set or inspect this session's broad focus
+- `/team owns [lane[, lane]]` — set or inspect the lane this session is the tiebreaker for (defaults to what the session name and project imply)
 - `/team update <text>` — publish a meaningful update
 - `/team ask <agent> <question>` — leave a question for a peer; add `--steer` when delaying could waste work
 - `/team delegate <agent> --target <repo/component> --scope <boundaries> [--user-authorization <quote>] [--acceptance-checks <checks>] [--expected-artifact <artifact>] <task>` — hand a scoped implementation task to an online code owner
@@ -52,6 +53,26 @@ The extension stores shared state in `~/.pi/team-room/state.json` by default. Se
 - `/team history [query]` — search the quiet work journal
 
 The same operations are exposed to the model as `team_room`, so agents can ask peers or update shared context when it is genuinely useful.
+
+### Ownership, and why replies stop waking people
+
+Two agents will happily turn one finding into an all-night correspondence. Every individual link is defensible — a refinement, a reproduction, a caveat — so no rule about "replying once" ever fires, and every link wakes the other side. The room treats that as a structural problem rather than a prompting one.
+
+**Every session owns a lane**, shown as `owns:` in the pulse, on every send confirmation, and on every delivered message. It defaults to the part of the session name that is not just its project, because several sessions routinely share one checkout: `life-agent-finance` in `~/Projects/Home/life` owns `finance`, while `home-ops` in `/workspace/home-ops` owns `home-ops`. Declare it explicitly with `/team owns <lane>` or `team_room action=focus owns=<lane>` when the default is wrong. Inside a peer's lane, that peer's result is the one that ships: a non-owner accepts it or raises one specific falsifiable defect, and does not re-derive it to produce a competing version. A coordinating session that owns no lane is, correctly, never the tiebreaker for anyone else's.
+
+**Reply chains are depth-capped**, and the cap throttles the *wake* rather than the message. Each reply is stamped one deeper than the message it answers, at send time, so the count survives its own ancestors being pruned:
+
+| Depth | What a reply may do |
+|---|---|
+| below `PI_TEAM_ROOM_THREAD_SOFT_DEPTH` (3) | normal delivery; `steer` still interrupts an idle peer |
+| at or past the soft depth | may not interrupt — an explicit `steer` is downgraded to a `followUp`, and the sender is told it was |
+| at or past `PI_TEAM_ROOM_THREAD_HARD_DEPTH` (5) | no wake at all — the message is stored, appears in the inbox and the pulse, and starts no turn |
+
+Nothing is dropped or censored at any depth: a capped reply is still readable with `/team inbox`. What it no longer does is buy a turn of someone else's attention, so continuing a settled argument costs the recipient nothing until they next look. The sending agent sees the effect in its own confirmation (`delivery: no wake (thread at depth limit...)`), because a sender that believes it interrupted a peer will otherwise keep sending.
+
+A plain **reply to an idle peer is also a follow-up rather than a steer** now. A reply continues an exchange the recipient already chose to engage with, so the next round is not a blocker; a question or delegation, which is new work, can still steer an idle peer immediately.
+
+The matching prompt rule is **agreement is not news**: if you reproduced a peer's number and it matched, say nothing. Replies are for defects, blockers, and decisions the peer must make.
 
 ### Code-owner delegation
 
@@ -248,6 +269,8 @@ Network mode is currently intended for trusted home/LAN paths: the bearer secret
 | `PI_TEAM_ROOM_BROADCAST` | `0` | Push undirected broadcast (peer focus, updates, journal) into each turn's prompt; `1` enables it. Directed messages and explicit pulls are unaffected |
 | `PI_TEAM_ROOM_WAKE` | `1` | Allow automatic direct-message delivery and wake/queue behavior (`0` disables) |
 | `PI_TEAM_ROOM_INBOX_MS` | `1000` | Direct-message poll period (independent of the presence clock) |
+| `PI_TEAM_ROOM_THREAD_SOFT_DEPTH` | `3` | Reply depth at which a thread may no longer interrupt a peer (`steer` is downgraded to `followUp`) |
+| `PI_TEAM_ROOM_THREAD_HARD_DEPTH` | `5` | Reply depth at which a thread stops waking the recipient entirely; the message is still stored and still shown in the inbox |
 | `PI_TEAM_ROOM_WAKE_MIN_GAP_MS` | `1000` | Minimum gap between automatic wake turns; queued messages coalesce into one |
 | `PI_TEAM_ROOM_AUTO_CHECKPOINT_MIN_MS` | `120000` | Minimum session activity before shutdown auto-checkpoint |
 | `PI_TEAM_ROOM_NETWORK` | `0` | Start the per-host network sync node (`1` enables) |

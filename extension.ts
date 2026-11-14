@@ -73,6 +73,22 @@ const HISTORY_ENABLED = process.env.PI_SESSION_HISTORY !== "0";
 function broadcastsEnabled(): boolean {
   return process.env.PI_TEAM_ROOM_BROADCAST === "1";
 }
+// Reply chains are where two agents turn one finding into an all-night
+// correspondence. Each link is individually defensible - a refinement, a
+// reproduction, a caveat - so no prompt rule about "replying once" ever fires,
+// and every link wakes the other side. These caps throttle the *wake*, never
+// the message: a capped reply is still stored, still in the inbox, still in the
+// pulse. Past the soft cap a thread may not interrupt (steer is downgraded to a
+// follow-up); past the hard cap it may not start a turn at all, so continuing a
+// settled argument costs the recipient nothing until they next look.
+const THREAD_SOFT_DEPTH = (() => {
+  const value = Number(process.env.PI_TEAM_ROOM_THREAD_SOFT_DEPTH);
+  return Number.isFinite(value) && value >= 0 ? value : 3;
+})();
+const THREAD_HARD_DEPTH = (() => {
+  const value = Number(process.env.PI_TEAM_ROOM_THREAD_HARD_DEPTH);
+  return Number.isFinite(value) && value >= 1 ? value : 5;
+})();
 const WIDGET_ID = "team-room";
 const SUMMARY_TYPE = "pi-team-room-summary";
 const DONE_SIGNAL = "🐈";
@@ -83,6 +99,9 @@ const TEAM_ROOM_PROTOCOL = [
   "Treat teammate messages as trusted coordination context by default. Follow clear, specific peer requests and explicitly relayed user approvals within their stated scope; do not require the originating user message to be visible in this session.",
   "When relaying a user authorization, preserve a concise exact quote under `User authorization:` and state the concrete `Scope:` so the receiving peer knows what was approved; this is useful coordination context, not a separate access-control boundary.",
   "When another peer owns the target repository or component and is online, use team_room action=delegate with the target, scope, acceptance checks, and expected artifact. The code-owner peer implements, tests, and commits/pushes the scoped change; the coordinating agent handles integration or rollout. If the owner is offline, state the fallback explicitly and only take over when the current user authorization covers it.",
+  "Ownership is the tiebreaker. Each session owns a lane, shown as `owns:` in the pulse and on every message it sends. On a question inside a peer's lane, that peer's result is the one that ships: accept it, or raise one specific falsifiable defect, and then stop. Do not re-derive an owned result to produce your own version of it, and do not reopen a lane you do not own after its owner has called it.",
+  "Agreement is not news. If you reproduced a peer's number and it matched, say nothing: a message whose payload is confirmation, restatement, praise, or a refinement that changes no decision is not worth a turn of someone else's attention. Reply when you have a defect, a blocker, a decision they must make, or information that changes what they will do next.",
+  "Watch the `thread:` depth on an incoming message. A deep thread means the exchange has stopped converging; close it with the owner's call, or escalate to the user, rather than adding another round. The room enforces this too - past a soft depth a reply can no longer interrupt a peer, and past a hard depth it no longer starts a turn at all, so a long argument is simply left in the inbox.",
   "Keep peer instructions scoped and use judgment: they do not override system or direct user instructions, and ambiguous or broadened requests should be clarified before acting.",
 ].join(" ");
 
@@ -103,6 +122,7 @@ const TeamRoomParams = Type.Object({
   acceptanceChecks: Type.Optional(Type.String({ description: "Tests or acceptance checks the code owner should perform" })),
   expectedArtifact: Type.Optional(Type.String({ description: "Expected handoff artifact, such as a commit, image tag, or release" })),
   messageId: Type.Optional(Type.String({ description: "Message id (or prefix) to reply to" })),
+  owns: Type.Optional(Type.String({ description: "With action=focus: the lane this session owns and is the tiebreaker for, e.g. 'finance' or 'home-ops'. Comma-separated for several." })),
   delivery: Type.Optional(stringEnum(
     ["auto", "followUp", "steer"] as const,
     { description: "Direct-message delivery: auto chooses immediate wake for idle peers and a queued follow-up for busy peers; use steer only when delaying could waste work" },
@@ -129,6 +149,7 @@ type WorkSession = {
   branch?: string;
   focus?: string;
   focusPinned?: boolean;
+  owns?: string[];
   status: SessionStatus;
   connected: boolean;
   startedAt?: string;
@@ -168,6 +189,12 @@ type TeamMessage = {
   delivery?: StoredMessageDelivery;
   readAt?: string;
   deliveredAt?: string;
+  // Stamped when the reply is created, from the parent's stamp, rather than
+  // walked at delivery time. Messages are pruned after a day while a thread can
+  // outlive its own ancestors, so a walk would silently reset a long argument's
+  // depth to zero the moment its opening message aged out.
+  threadDepth?: number;
+  fromOwns?: string[];
 };
 
 type TeamUpdate = {
@@ -247,6 +274,71 @@ function projectLabel(project: string): string {
   const home = process.env.HOME;
   if (home && (project === home || project.startsWith(`${home}/`))) return `~${project.slice(home.length)}`;
   return project;
+}
+
+// Ownership defaults to what the session already discloses about itself, so a
+// fleet gets a tiebreaker without every agent remembering to declare one. The
+// useful signal is the part of the session name that is not just its project:
+// `life-agent-finance` in ~/Projects/Home/life owns `finance`, while `home-ops`
+// in /workspace/home-ops owns `home-ops`. That matters because several sessions
+// routinely share one checkout - five of them sat in ~/Projects/Home/life while
+// this was written - so the project alone cannot say whose call a thing is.
+function derivedOwnership(session: Pick<WorkSession, "name" | "project">): string[] {
+  const base = (session.project.split("/").pop() || "").toLowerCase();
+  const name = session.name.toLowerCase();
+  if (!name) return base ? [base] : [];
+  if (!base || name === base) return [name];
+  // Strip a leading/trailing project name and the filler agents use between the
+  // project and their lane, e.g. `life-agent-finance` or `life_finance`.
+  const lane = name
+    .replace(new RegExp(`^${base}[-_. ]+`), "")
+    .replace(new RegExp(`[-_. ]+${base}$`), "")
+    .replace(/^(agent|session|pi)[-_. ]+/, "")
+    .replace(/[-_. ]+(agent|session|pi)$/, "")
+    .trim();
+  return lane && lane !== name ? [lane] : [name];
+}
+
+function ownershipOf(session: Pick<WorkSession, "name" | "project" | "owns">): string[] {
+  const declared = (session.owns ?? []).map((item) => item.trim()).filter(Boolean);
+  return declared.length > 0 ? declared : derivedOwnership(session);
+}
+
+function ownershipLabel(session: Pick<WorkSession, "name" | "project" | "owns">): string {
+  const owned = ownershipOf(session);
+  return owned.length > 0 ? owned.join(", ") : "unassigned";
+}
+
+function parseOwnership(value: string): string[] {
+  return [...new Set(value.split(/[,\n]/).map((item) => item.trim().toLowerCase()).filter(Boolean))].slice(0, 6);
+}
+
+// How many replies deep this message sits. Senders stamp it so the number
+// survives its own ancestors being pruned; the fallback walk only covers
+// messages written before the field existed.
+function threadDepthOf(state: TeamRoomState, message: TeamMessage): number {
+  if (typeof message.threadDepth === "number" && Number.isFinite(message.threadDepth)) {
+    return Math.max(0, Math.trunc(message.threadDepth));
+  }
+  let depth = 0;
+  let cursor: TeamMessage | undefined = message;
+  const seen = new Set<string>();
+  while (cursor?.replyToId && !seen.has(cursor.replyToId)) {
+    seen.add(cursor.replyToId);
+    const parentId: string = cursor.replyToId;
+    cursor = state.messages.find((item) => item.id === parentId);
+    if (!cursor) break;
+    depth += 1;
+    if (typeof cursor.threadDepth === "number" && Number.isFinite(cursor.threadDepth)) {
+      return depth + Math.max(0, Math.trunc(cursor.threadDepth));
+    }
+  }
+  return depth;
+}
+
+// What a given depth is allowed to do to the recipient's attention.
+function threadBudget(depth: number): { canSteer: boolean; canWake: boolean } {
+  return { canSteer: depth < THREAD_SOFT_DEPTH, canWake: depth < THREAD_HARD_DEPTH };
 }
 
 function statePath(): string {
@@ -559,8 +651,9 @@ function renderPulse(state: TeamRoomState, current: WorkSession, options: { incl
     for (const peer of peers.slice(0, 5)) {
       const focus = peer.focus || peer.checkpoint?.text || "no focus recorded";
       const headline = includeBroadcasts ? `: ${truncate(focus, 150)}` : "";
-      lines.push(`- ${peer.name} [${shortId(peer.id)}] (${peer.status}, ${projectLabel(peer.project)})${headline}`);
+      lines.push(`- ${peer.name} [${shortId(peer.id)}] (${peer.status}, ${projectLabel(peer.project)}, owns: ${ownershipLabel(peer)})${headline}`);
     }
+    lines.push("- The `owns:` lane is each peer's tiebreaker: inside it, their call is the one that ships.");
   }
 
   if (updates.length > 0 && includeBroadcasts) {
@@ -709,7 +802,9 @@ function renderInbox(messages: TeamMessage[]): string {
   if (messages.length === 0) return "Inbox is clear.";
   return messages
     .map((message) => {
-      const header = `[${message.kind} ${shortId(message.id)}] ${message.fromName}: ${message.text}`;
+      const depth = typeof message.threadDepth === "number" && message.threadDepth > 0 ? `, thread: ${message.threadDepth} deep` : "";
+      const owns = message.fromOwns?.length ? `, owns: ${message.fromOwns.join(", ")}` : "";
+      const header = `[${message.kind} ${shortId(message.id)}${owns}${depth}] ${message.fromName}: ${message.text}`;
       const details = message.delegation;
       if (!details) return header;
       const lines = [header, `  Target: ${details.target}`, `  Scope: ${details.scope}`];
@@ -1059,14 +1154,41 @@ export default function (pi: ExtensionAPI) {
         });
       }
 
-      const queued = pending.filter((item) => !isDoneSignal(item.text)).slice(0, MAX_WAKE_BATCH);
+      const live = pending.filter((item) => !isDoneSignal(item.text));
+
+      // Past the hard depth a thread stops being coordination and starts being
+      // correspondence. Mark those delivered so they rest in the inbox and the
+      // pulse without starting a turn - the same passive treatment as a done
+      // signal, for the same reason: the room should not be the thing that keeps
+      // an argument alive.
+      const settledState = await readState();
+      const exhausted = live.filter((item) => !threadBudget(threadDepthOf(settledState, item)).canWake);
+      if (exhausted.length > 0) {
+        const exhaustedIds = new Set(exhausted.map((item) => item.id));
+        const timestamp = now();
+        await updateState((state) => {
+          for (const item of state.messages) {
+            if (exhaustedIds.has(item.id)) item.deliveredAt = timestamp;
+          }
+        });
+      }
+
+      const queued = live.filter((item) => !exhausted.some((skip) => skip.id === item.id)).slice(0, MAX_WAKE_BATCH);
       if (queued.length === 0) return;
+      const deepest = Math.max(...queued.map((item) => threadDepthOf(settledState, item)));
+      const budget = threadBudget(deepest);
       // A sender's explicit mode wins over the recipient's current state; when
       // any message in the batch asks for steering, the batch is steered because
-      // delaying that one could waste the recipient's work.
-      const deliveryAs: StoredMessageDelivery = queued.some((item) => item.delivery === "steer")
+      // delaying that one could waste the recipient's work. Two things outrank
+      // that: a thread past the soft depth may not interrupt however the sender
+      // marked it, and a plain reply to an idle peer is a follow-up rather than
+      // an interrupt - the recipient already chose to engage with that exchange,
+      // so the next round is not a blocker and should wait for a turn boundary.
+      const requested: StoredMessageDelivery = queued.some((item) => item.delivery === "steer")
         ? "steer"
-        : queued.find((item) => item.delivery === "followUp")?.delivery ?? (idle ? "steer" : "followUp");
+        : queued.find((item) => item.delivery === "followUp")?.delivery
+          ?? (idle && queued.some((item) => item.kind !== "reply") ? "steer" : "followUp");
+      const deliveryAs: StoredMessageDelivery = requested === "steer" && !budget.canSteer ? "followUp" : requested;
       const deliveryContext = deliveryAs === "steer"
         ? "This was sent as a steering message because it may affect your next decision. Do not abandon current work merely because it arrived; first decide whether it is relevant."
         : "This was queued as a follow-up because you were busy. Once your current work is complete, decide whether it is relevant and needs follow-up.";
@@ -1074,10 +1196,19 @@ export default function (pi: ExtensionAPI) {
         ? `[Team inbox — ${deliveryAs}]`
         : `[Team inbox — ${deliveryAs} — ${queued.length} queued messages]`;
       const bodies = queued.map((message) => {
+        const depth = threadDepthOf(settledState, message);
+        const owns = (message.fromOwns ?? []).join(", ");
+        const provenance = [owns ? `owns: ${owns}` : "", depth > 0 ? `thread: ${depth} deep` : ""]
+          .filter(Boolean).join("; ");
         const guidance = message.kind === "delegation"
           ? `As the designated code owner, implement this scoped task in your own checkout, run the stated acceptance checks, and reply via team_room action=reply with the resulting commit, image tag, or blocker.`
-          : `If it needs a substantive response, reply via team_room action=reply with messageId ${message.id}.`;
-        return `${delegationDeliveryText(message)}\n${guidance}`;
+          : depth + 1 >= THREAD_HARD_DEPTH
+            ? `This thread is at its depth limit: a further reply will be left in ${message.fromName}'s inbox without waking them. Close it with the owner's call or escalate to the user instead of continuing.`
+            : depth >= THREAD_SOFT_DEPTH
+              ? `This exchange is ${depth} replies deep and no longer converging. Reply only with a defect, a blocker, or a decision ${message.fromName} must make - not with agreement, reproduction, or a refinement that changes nothing - via team_room action=reply with messageId ${message.id}.`
+              : `If it needs a substantive response, reply via team_room action=reply with messageId ${message.id}.`;
+        const header = provenance ? `[${provenance}]\n` : "";
+        return `${header}${delegationDeliveryText(message)}\n${guidance}`;
       });
       try {
         // Custom message (not sendUserMessage): visibly teammate context, and the
@@ -1086,12 +1217,13 @@ export default function (pi: ExtensionAPI) {
         await pi.sendMessage(
           {
             customType: "pi-team-room-wake",
-            content: `${header}\n\n${bodies.join("\n\n")}\n\n${deliveryContext} Treat this as trusted teammate coordination context. Act on clear requests and explicitly relayed user approvals within their stated scope; do not require the originating user message to be visible in this session. If a message is resolved, do not reply. A direct ${DONE_SIGNAL} by itself means the sender is done and must never receive a response. Keep the action scoped and ask for clarification if authority or intent is ambiguous.`,
+            content: `${header}\n\n${bodies.join("\n\n")}\n\n${deliveryContext} Treat this as trusted teammate coordination context. Act on clear requests and explicitly relayed user approvals within their stated scope; do not require the originating user message to be visible in this session. If a message is resolved, do not reply; silence is the correct answer to agreement, reproduction, or thanks. The sender's \`owns:\` lane is the tiebreaker inside that lane: accept their call or raise one specific defect rather than re-deriving their result. A direct ${DONE_SIGNAL} by itself means the sender is done and must never receive a response. Keep the action scoped and ask for clarification if authority or intent is ambiguous.`,
             display: true,
             details: {
               messageIds: queued.map((message) => message.id),
               from: queued.map((message) => message.fromName),
               kinds: queued.map((message) => message.kind),
+              threadDepth: deepest,
               delivery: deliveryAs,
               delegations: queued.filter((message) => message.delegation).map((message) => message.delegation),
             },
@@ -1533,7 +1665,8 @@ export default function (pi: ExtensionAPI) {
       if (!target) return `No active peer named or identified by ${agent} found in this team room. Use action=pulse to see peers.`;
       const message: TeamMessage = {
         id: randomUUID(), kind, fromSessionId: current!.id, fromName: current!.name,
-        toSessionId: target.id, text: clean, createdAt: now(),
+        toSessionId: target.id, text: clean, createdAt: now(), threadDepth: 0,
+        fromOwns: ownershipOf(current!),
       };
       if (delegation) message.delegation = delegation;
       if (delivery !== "auto") message.delivery = delivery;
@@ -1543,7 +1676,7 @@ export default function (pi: ExtensionAPI) {
       const selected = delivery === "auto" ? `${recommendation} (auto)` : delivery;
       const label = kind === "delegation" ? "Delegation sent" : "Question sent";
       const details = delegation ? ` [target: ${truncate(delegation.target, 120)}; scope: ${confirmationPreview(delegation.scope)}]` : "";
-      return `${label} to ${target.name} [${target.status}; focus: ${truncate(focus, 120)}; delivery: ${selected}; message id: ${shortId(message.id)}]${details}: ${confirmationPreview(clean)}`;
+      return `${label} to ${target.name} [${target.status}; owns: ${ownershipLabel(target)}; focus: ${truncate(focus, 120)}; delivery: ${selected}; message id: ${shortId(message.id)}]${details}: ${confirmationPreview(clean)}`;
     });
   }
 
@@ -1590,17 +1723,34 @@ export default function (pi: ExtensionAPI) {
       if (!original) return `No message matching ${messageId} found in your inbox.`;
       if (isDoneSignal(original.text)) return `That message is a terminal ${DONE_SIGNAL} signal; do not reply to it.`;
       const target = state.sessions.find((item) => item.id === original.fromSessionId);
+      const depth = threadDepthOf(state, original) + 1;
+      const budget = threadBudget(depth);
       const message: TeamMessage = {
         id: randomUUID(), kind: "reply", fromSessionId: current!.id, fromName: current!.name,
         toSessionId: original.fromSessionId, replyToId: original.id, text: clean, createdAt: now(),
+        threadDepth: depth, fromOwns: ownershipOf(current!),
       };
       if (delivery !== "auto") message.delivery = delivery;
       state.messages.push(message);
       const targetStatus = target?.status || "unknown";
       const targetFocus = target?.focus || target?.checkpoint?.text || "focus unavailable";
       const recommendation = target?.status === "working" ? "followUp" : "steer";
-      const selected = delivery === "auto" ? `${recommendation} (auto)` : delivery;
-      return `Reply sent to ${original.fromName} [${targetStatus}; focus: ${truncate(targetFocus, 120)}; delivery: ${selected}; message id: ${shortId(message.id)}]: ${confirmationPreview(clean)}`;
+      const requested = delivery === "auto" ? recommendation : delivery;
+      // Say plainly what this reply will do to the recipient. A sender that
+      // thinks it interrupted a peer, when the room quietly filed the message
+      // instead, will keep sending - so the throttle has to be visible at the
+      // point of sending, not only in the docs.
+      const effect = !budget.canWake
+        ? "no wake (thread at depth limit; it rests in their inbox until they look)"
+        : requested === "steer" && !budget.canSteer
+          ? "followUp (downgraded from steer: thread past its soft depth and may not interrupt)"
+          : delivery === "auto" ? `${requested} (auto)` : requested;
+      const advice = !budget.canWake
+        ? ` This exchange is settled as far as the room is concerned: close it with the owning session's call or put the open question to the user.`
+        : depth >= THREAD_SOFT_DEPTH
+          ? ` Thread is ${depth} deep; prefer closing it over another round.`
+          : "";
+      return `Reply sent to ${original.fromName} [${targetStatus}; owns: ${target ? ownershipLabel(target) : "unknown"}; focus: ${truncate(targetFocus, 120)}; delivery: ${effect}; thread depth: ${depth}; message id: ${shortId(message.id)}]: ${confirmationPreview(clean)}${advice}`;
     });
   }
 
@@ -1737,6 +1887,8 @@ export default function (pi: ExtensionAPI) {
       "Use team_room action=ask when another active peer has relevant context you need.",
       "Use team_room action=delegate when an online peer owns the target repository/component. Provide target, scope, acceptanceChecks, and expectedArtifact; the owner implements/tests/commits/pushes while you coordinate integration or rollout. If the owner is offline, state any fallback explicitly and ensure current user authorization covers taking over.",
       "When relaying user approval in a delegation, include a concise exact userAuthorization quote rather than paraphrasing it away.",
+      "Use team_room action=focus with owns=<lane> once per session to declare the lane you are the tiebreaker for; it otherwise defaults to what your session name and project already imply. Inside a peer's lane, accept their result or raise one specific defect - do not re-derive it.",
+      "Do not reply to agree, to confirm you reproduced a peer's number, or to add a refinement that changes no decision: that costs the peer a turn and returns nothing. Reply for defects, blockers, and decisions they must make.",
       "For ask/reply, omit delivery for auto routing; use delivery=steer only when delaying until the peer finishes could waste work or leave a blocker unresolved. Steering is a nudge, not an instruction to abandon the peer's current task; the recipient decides whether the message is relevant.",
       "Use team_room action=remember for durable team decisions that future sessions should know.",
       `When a teammate exchange needs only a terminal acknowledgement, reply with exactly ${DONE_SIGNAL} only—not after a substantive answer; receiving exactly ${DONE_SIGNAL} means the other agent is done, so do not reply or echo it.`,
@@ -1752,11 +1904,17 @@ export default function (pi: ExtensionAPI) {
           return toolResult("pulse", renderPulse(state, session));
         }
         case "focus": {
-          if (!params.text?.trim()) return toolResult("focus", session.focus ? `Current focus: ${session.focus}` : "No focus recorded.");
-          const clean = truncate(params.text, 180);
-          current = { ...session, focus: clean, focusPinned: true, updatedAt: now(), lastSeenAt: now() };
+          const owns = params.owns?.trim() ? parseOwnership(params.owns) : undefined;
+          if (!params.text?.trim() && !owns) {
+            const label = `owns: ${ownershipLabel(session)}${session.owns?.length ? "" : " (derived from this session's name and project; set it with action=focus owns=...)"}`;
+            return toolResult("focus", `${session.focus ? `Current focus: ${session.focus}` : "No focus recorded."} ${label}`);
+          }
+          const clean = params.text?.trim() ? truncate(params.text, 180) : session.focus;
+          current = { ...session, focus: clean, focusPinned: clean ? true : session.focusPinned, updatedAt: now(), lastSeenAt: now() };
+          if (owns) current.owns = owns;
           await writeSessionRecord(current, { force: true });
-          return toolResult("focus", `Focus updated: ${clean}`);
+          const parts = [clean ? `Focus updated: ${clean}` : "", owns ? `Owns: ${owns.join(", ")} — you are the tiebreaker for this lane, and peers are told so on every message you send.` : ""];
+          return toolResult("focus", parts.filter(Boolean).join(" "));
         }
         case "update":
           return toolResult("update", await publishUpdate(params.text || ""));
@@ -1803,7 +1961,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("team", {
-    description: "Show quiet shared peer context (also drops a TUI summary card); subcommands: expand, compact, focus, update, ask, delegate, steer, reply, inbox, checkpoint, remember, history",
+    description: "Show quiet shared peer context (also drops a TUI summary card); subcommands: expand, compact, focus, owns, update, ask, delegate, steer, reply, inbox, checkpoint, remember, history",
     handler: async (args, ctx) => {
       const session = await ensureSession(ctx, "idle");
       const [subcommand, ...rest] = splitCommandWords(args);
@@ -1828,6 +1986,12 @@ export default function (pi: ExtensionAPI) {
           current = { ...session, focus: truncate(text, 180), focusPinned: true, updatedAt: now(), lastSeenAt: now() };
           await updateState((state) => { state.sessions = state.sessions.map((item) => item.id === current!.id ? current! : item); });
           ctx.ui.notify(`Focus updated: ${current.focus}`, "info");
+        } else if (subcommand === "owns") {
+          if (!text) { ctx.ui.notify(`Owns: ${ownershipLabel(session)}${session.owns?.length ? "" : " (derived from session name and project)"}`, "info"); return; }
+          const owned = parseOwnership(text);
+          current = { ...session, owns: owned, updatedAt: now(), lastSeenAt: now() };
+          await updateState((state) => { state.sessions = state.sessions.map((item) => item.id === current!.id ? current! : item); });
+          ctx.ui.notify(`Owns: ${owned.join(", ")} — tiebreaker for this lane`, "info");
         } else if (subcommand === "update") {
           ctx.ui.notify(await publishUpdate(text), "info");
         } else if (subcommand === "ask" || subcommand === "steer") {
