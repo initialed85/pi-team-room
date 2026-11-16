@@ -1830,10 +1830,19 @@ export default function (pi: ExtensionAPI) {
     const roomUse = broadcasts
       ? "Use team_room only for meaningful updates, questions, replies, checkpoints, decisions, or relevant history. Do not narrate routine file edits or test runs."
       : "Undirected broadcasts are off here: do not publish updates or expect peer focus to arrive on its own. Use team_room only for directed questions, replies, and delegations, for your own checkpoint, or for history you deliberately pull. Do not narrate routine file edits or test runs.";
+    // Keep the system prompt stable: a volatile pulse here would change the
+    // token prefix before the entire conversation history and force a full
+    // prefill on every peer status/message change. The static protocol belongs
+    // in the system prompt; this turn's room snapshot is appended after the
+    // starting user/custom message so the existing prefix remains cacheable.
     return {
-      // Use the system prompt rather than a persistent custom message: the
-      // pulse is ambient state for this turn, not another transcript entry.
-      systemPrompt: `${event.systemPrompt}\n\n## Shared team room\n${pulse}${checkpoint}\n\n${TEAM_ROOM_PROTOCOL} ${roomUse}`,
+      systemPrompt: `${event.systemPrompt}\n\n## Shared team room\n${TEAM_ROOM_PROTOCOL} ${roomUse}`,
+      message: {
+        customType: "pi-team-room-pulse",
+        content: `${pulse}${checkpoint}`,
+        display: false,
+        details: { broadcasts },
+      },
     };
   });
 

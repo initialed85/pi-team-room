@@ -280,20 +280,32 @@ try {
   assert.match(await call(alpha, { action: "update", text: "should not broadcast" }), /Broadcasts are off/);
   assert.match(await call(bravo, { action: "pulse" }), /flaky test/, "an explicit pulse still pulls the room");
   const quietStart = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
-  assert.ok(!quietStart.systemPrompt.includes("flaky test"), "a peer update is not pushed into a turn start");
-  assert.ok(!quietStart.systemPrompt.includes("auth refactor"), "a peer focus is not pushed into a turn start");
+  assert.ok(!quietStart.systemPrompt.includes("Team pulse"), "the volatile pulse is not put in the system prompt");
+  assert.ok(!quietStart.systemPrompt.includes("flaky test"), "a peer update is not put in the system prompt");
+  assert.ok(!quietStart.systemPrompt.includes("auth refactor"), "a peer focus is not put in the system prompt");
   assert.match(quietStart.systemPrompt, /Undirected broadcasts are off/);
+  assert.match(quietStart.message.content, /Team pulse/, "the current pulse is appended as turn context");
+  assert.ok(!quietStart.message.content.includes("flaky test"), "broadcast-off updates stay pull-only even in appended context");
+  assert.equal(quietStart.message.display, false, "turn context does not create a visible transcript card");
+  const quietSystemPrompt = quietStart.systemPrompt;
+  await alpha.handlers.agent_settled({}, alpha.ctx);
+  const afterPeerStatusChange = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
+  assert.equal(afterPeerStatusChange.systemPrompt, quietSystemPrompt, "peer status changes do not rewrite the system prompt");
+  assert.notEqual(afterPeerStatusChange.message.content, quietStart.message.content, "the changed pulse stays in appended turn context");
   assert.match(await call(bravo, { action: "pulse" }), /flaky test/, "a quiet turn start does not swallow the update for later pulls");
   process.env.PI_TEAM_ROOM_BROADCAST = "1";
 
   assert.match(await call(bravo, { action: "ask", agent: "alpha", text: "which test is flaky?" }), /Question sent/);
   const injected = await alpha.handlers.before_agent_start({ systemPrompt: "BASE" }, alpha.ctx);
   assert.match(injected.systemPrompt, /^BASE/);
-  assert.match(injected.systemPrompt, /which test is flaky/);
+  assert.ok(!injected.systemPrompt.includes("Team pulse"), "dynamic teammate content cannot pollute the system prompt");
+  assert.ok(!injected.systemPrompt.includes("which test is flaky"), "direct messages stay out of the system prompt");
   assert.match(injected.systemPrompt, /trusted coordination context/);
   assert.match(injected.systemPrompt, /explicitly relayed user approvals/);
   assert.match(injected.systemPrompt, /code-owner peer/);
+  assert.match(injected.message.content, /which test is flaky/);
   assert.match(injected.systemPrompt, /User authorization/);
+  assert.equal(injected.message.customType, "pi-team-room-pulse");
   const alphaAfterPrompt = JSON.parse(readFileSync(statePath, "utf8")).sessions.find((session) => session.id === alpha.ctx.sessionManager.getSessionId());
   assert.equal(alphaAfterPrompt.focus, "auth refactor", "explicit focus survives the next prompt boundary");
 
@@ -793,7 +805,9 @@ try {
     { systemPrompt: "BASE", messageType: "user", prompt: "fix /tmp/project-churn/src/auth.ts" },
     churn.ctx,
   );
-  assert.match(promptStart.systemPrompt, /^BASE/, "the pulse is still injected into the system prompt");
+  assert.match(promptStart.systemPrompt, /^BASE/, "the static room protocol stays on the system prompt");
+  assert.ok(!promptStart.systemPrompt.includes("Team pulse"), "the volatile pulse is not rebuilt in the system prompt");
+  assert.match(promptStart.message.content, /Team pulse/, "the volatile pulse is appended as turn context");
   const promptedRecord = JSON.parse(readFileSync(statePath, "utf8")).sessions.find((session) => session.id === churn.ctx.sessionManager.getSessionId());
   assert.equal(promptedRecord.status, "working", "the turn start still registers the session as working");
   assert.ok(promptedRecord.lastPulseAt, "the pulse stamp lands in the same write as the record");

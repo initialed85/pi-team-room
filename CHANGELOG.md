@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Keep volatile pulse data out of the per-turn system prompt. The static room protocol remains in the system prompt, while the current pulse is delivered as hidden appended turn context so peer status, membership, checkpoints, and messages cannot invalidate the reusable provider prefix. Regression coverage asserts that dynamic pulse content is absent from the system prompt and remains available in the appended context.
 - Each session now **owns a lane** and is the tiebreaker inside it. Ownership shows as `owns:` in the
   pulse, on every send confirmation, and on every delivered message; it defaults to the part of the
   session name that is not just its project (`life-agent-finance` in `~/Projects/Home/life` owns
