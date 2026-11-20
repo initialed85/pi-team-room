@@ -292,6 +292,27 @@ try {
   const afterPeerStatusChange = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
   assert.equal(afterPeerStatusChange.systemPrompt, quietSystemPrompt, "peer status changes do not rewrite the system prompt");
   assert.notEqual(afterPeerStatusChange.message.content, quietStart.message.content, "the changed pulse stays in appended turn context");
+
+  // The appended pulse is a transcript entry, so every copy stays in context for
+  // the rest of the session. A room that has not moved must not re-describe it.
+  const unchangedRoom = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
+  assert.equal(unchangedRoom.message, undefined, "an unchanged room is not re-injected");
+  assert.equal(unchangedRoom.systemPrompt, afterPeerStatusChange.systemPrompt, "the stable system prompt is returned either way");
+
+  // Same rule for the checkpoint, which is the expensive half of the block:
+  // a full one is shown when it is new or when a compaction ate the earlier
+  // copy, and a one-line pointer otherwise.
+  await call(bravo, { action: "checkpoint", text: "resume at the pulse assertions in test/harness.mjs" });
+  const withFreshCheckpoint = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
+  assert.match(withFreshCheckpoint.message.content, /resume at the pulse assertions/, "a checkpoint that moved is shown in full");
+  await alpha.handlers.before_agent_start({ systemPrompt: "BASE" }, alpha.ctx);
+  const pulseMovedButCheckpointDidNot = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
+  assert.match(pulseMovedButCheckpointDidNot.message.content, /Team pulse/, "the changed pulse is still delivered");
+  assert.match(pulseMovedButCheckpointDidNot.message.content, /checkpoint is unchanged/, "an unchanged checkpoint is not repeated");
+  assert.ok(!pulseMovedButCheckpointDidNot.message.content.includes("resume at the pulse assertions"), "the unchanged checkpoint is a pointer, not a re-send");
+  await bravo.handlers.session_compact({}, bravo.ctx);
+  const afterCompaction = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
+  assert.match(afterCompaction.message.content, /resume at the pulse assertions/, "a compaction restates the room and the checkpoint in full");
   assert.match(await call(bravo, { action: "pulse" }), /flaky test/, "a quiet turn start does not swallow the update for later pulls");
   process.env.PI_TEAM_ROOM_BROADCAST = "1";
 

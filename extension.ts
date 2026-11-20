@@ -886,6 +886,16 @@ export default function (pi: ExtensionAPI) {
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let lastAutoWakeAt = 0;
   let lastPresenceAt = 0;
+  // The pulse is appended as a hidden transcript entry, so every turn's copy
+  // stays in the model's context for the rest of the session. An unchanged room
+  // used to be re-described every turn, and a 2,000-character checkpoint was
+  // repeated verbatim even when it had not moved. Say something new, or say
+  // nothing: the previous entry is still there to be read.
+  let lastPulse: string | undefined;
+  let lastCheckpointShownAt: string | undefined;
+  // After a compaction the earlier pulse is no longer in context, so the next
+  // turn has to restate the room and the checkpoint in full.
+  let restockRoomContext = true;
   let deliveryInFlight = false;
   // Messages already pushed into this session in-process. If the delivered stamp
   // fails to land, the next poll must not wake the peer a second time for them.
@@ -1862,6 +1872,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_compact", async (_event, ctx) => {
+    // The summary replaces older entries, including the room's pulse and
+    // checkpoint. Ask for them again on the next turn instead of letting the
+    // session resume blind.
+    restockRoomContext = true;
+    lastPulse = undefined;
+    lastCheckpointShownAt = undefined;
     queueSessionHistory(ctx);
   });
 
@@ -1884,7 +1900,13 @@ export default function (pi: ExtensionAPI) {
     const paths = mentionedPaths(event.messageType === "user" ? event.prompt : undefined);
     const session = await ensureSession(ctx, "working", { paths, pulseAt });
     const pulse = renderPulse(await readState(), session, { includeBroadcasts: broadcasts });
-    const checkpoint = session.checkpoint ? `\n\nYour current checkpoint:\n- ${session.checkpoint.text}` : "";
+    const pulseChanged = pulse !== lastPulse;
+    // A checkpoint earns a full re-send when it moved since the last one, or
+    // when a compaction dropped the earlier copy. Otherwise the model already
+    // has it in context and the rest of the turn is cheaper for everyone.
+    const restatesCheckpoint = !!session.checkpoint && (
+      restockRoomContext || lastCheckpointShownAt !== session.checkpoint.updatedAt
+    );
     const roomUse = broadcasts
       ? "Use team_room only for meaningful updates, questions, replies, checkpoints, decisions, or relevant history. Do not narrate routine file edits or test runs."
       : "Undirected broadcasts are off here: do not publish updates or expect peer focus to arrive on its own. Use team_room only for directed questions, replies, and delegations, for your own checkpoint, or for history you deliberately pull. Do not narrate routine file edits or test runs.";
@@ -1893,13 +1915,30 @@ export default function (pi: ExtensionAPI) {
     // prefill on every peer status/message change. The static protocol belongs
     // in the system prompt; this turn's room snapshot is appended after the
     // starting user/custom message so the existing prefix remains cacheable.
+    const systemPrompt = `${event.systemPrompt}\n\n## Shared team room\n${TEAM_ROOM_PROTOCOL} ${roomUse}`;
+    const staticOnly = { systemPrompt };
+    if (!pulseChanged && !restatesCheckpoint) {
+      // Nothing new since the entry the model can already see. Appending another
+      // copy is the cost that made a long session pay for the room forever.
+      return staticOnly;
+    }
+    const parts: string[] = [];
+    if (pulseChanged) parts.push(pulse);
+    if (session.checkpoint) {
+      parts.push(restatesCheckpoint
+        ? `Your current checkpoint:\n- ${session.checkpoint.text}`
+        : `Your checkpoint is unchanged since it was last shown (${session.checkpoint.updatedAt}).`);
+    }
+    if (pulseChanged) lastPulse = pulse;
+    if (restatesCheckpoint && session.checkpoint) lastCheckpointShownAt = session.checkpoint.updatedAt;
+    restockRoomContext = false;
     return {
-      systemPrompt: `${event.systemPrompt}\n\n## Shared team room\n${TEAM_ROOM_PROTOCOL} ${roomUse}`,
+      systemPrompt,
       message: {
         customType: "pi-team-room-pulse",
-        content: `${pulse}${checkpoint}`,
+        content: parts.join("\n\n"),
         display: false,
-        details: { broadcasts },
+        details: { broadcasts, pulseChanged, restatesCheckpoint },
       },
     };
   });
