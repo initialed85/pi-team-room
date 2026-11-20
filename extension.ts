@@ -119,7 +119,7 @@ const TeamRoomParams = Type.Object({
     ["pulse", "focus", "update", "ask", "delegate", "reply", "inbox", "checkpoint", "remember", "history"] as const,
     { description: "What to do in the team room" },
   ),
-  text: Type.Optional(Type.String({ description: "Focus, update, question, delegated task, checkpoint, or fact text" })),
+  text: Type.Optional(Type.String({ description: "Focus, update, question, delegated task, checkpoint, or fact text. Record caps: update 500, checkpoint 2,000, fact 2,000, message 6,000 characters; over a cap the middle is dropped and the result says so, so keep the essential detail at the end." })),
   agent: Type.Optional(Type.String({ description: "Peer session name for ask or delegate" })),
   target: Type.Optional(Type.String({ description: "Repository or component targeted by a delegated task" })),
   scope: Type.Optional(Type.String({ description: "Concrete boundaries of a delegated task" })),

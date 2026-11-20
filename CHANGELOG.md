@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- **Room records are clipped in the middle, and the writer is told.** A checkpoint or durable fact
+  over its cap used to be cut from the front and saved anyway, with a plain `Checkpoint saved` in
+  reply - so the resume instruction, which is the last line people write, was the first thing
+  deleted, and a note recording a cross-repo contract was chopped at the 500-character status-update
+  cap. Over-cap records now keep their head and their tail with a visible
+  ` [...N chars omitted...] ` seam, are stored marked `clipped`, and the result names the lost length
+  and the cap. Facts get their own 2,000-character budget instead of sharing a status line's.
+  Regression coverage asserts the tail survives, the seam and the `clipped` flag are stored, an
+  in-budget fact is kept whole, and reverting to front-clipping fails the suite.
+- **The appended room context is delivered only when it says something new.** The pulse is a hidden
+  transcript entry, so every turn's copy stays in the model's context for the rest of the session:
+  one measured build carried 64,901 characters of room context over 31 turns, and a 2,000-character
+  checkpoint was re-sent verbatim every turn whether or not it had moved. A turn whose pulse is
+  byte-identical to the one already in context now returns the stable system prompt and appends
+  nothing; a checkpoint that has not moved since it was last shown becomes a one-line pointer. A new
+  checkpoint, or a compaction (which removed the earlier copy from context), restates both in full.
+  Regression coverage asserts the quiet turn appends nothing, a moved checkpoint is shown in full, an
+  unchanged one is not repeated, and a compaction restates it.
 - Keep volatile pulse data out of the per-turn system prompt. The static room protocol remains in the system prompt, while the current pulse is delivered as hidden appended turn context so peer status, membership, checkpoints, and messages cannot invalidate the reusable provider prefix. Regression coverage asserts that dynamic pulse content is absent from the system prompt and remains available in the appended context.
 - Each session now **owns a lane** and is the tiebreaker inside it. Ownership shows as `owns:` in the
   pulse, on every send confirmation, and on every delivered message; it defaults to the part of the
