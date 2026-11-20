@@ -14,6 +14,11 @@ const STATE_ENV = "PI_TEAM_ROOM_STATE";
 const DEFAULT_STATE_PATH = join(process.env.HOME ?? ".", ".pi", "team-room", "state.json");
 const STALE_AFTER_MS = 30 * 60 * 1000;
 const MAX_UPDATE_LENGTH = 500;
+// A durable team fact used to share the one-line status-update cap, so a note
+// carrying a cross-repo contract was chopped at 500 characters. The journal is
+// bounded in aggregate by state-rules (maxJournal / maxJournalChars), so a
+// longer per-entry allowance cannot grow the file without limit.
+const MAX_JOURNAL_LENGTH = 2_000;
 const MAX_CHECKPOINT_LENGTH = 2_000;
 // Peer messages carry briefings, delegations, and acceptance checks. They used to
 // share the one-line status-update cap, which silently clipped long replies to
@@ -166,6 +171,8 @@ type Checkpoint = {
   updatedAt: string;
   sessionId: string;
   auto?: boolean;
+  /** The middle was dropped to fit the cap; the record is not the whole text. */
+  clipped?: boolean;
 };
 
 type DelegationDetails = {
@@ -204,6 +211,7 @@ type TeamUpdate = {
   project: string;
   text: string;
   createdAt: string;
+  clipped?: boolean;
 };
 
 type JournalItem = {
@@ -212,6 +220,7 @@ type JournalItem = {
   text: string;
   createdAt: string;
   sessionName: string;
+  clipped?: boolean;
 };
 
 type TeamRoomState = {
@@ -248,6 +257,41 @@ function normalizeMultiline(text: string): string {
 
 function messageText(text: string, max: number): string {
   return clip(normalizeMultiline(text), max);
+}
+
+const CLIP_RESERVE = 40;
+
+/**
+ * Fit text to a cap by dropping its MIDDLE instead of its end.
+ *
+ * Records that exist to be resumed from - checkpoints, durable facts - put the
+ * actionable part last ("resume point is X", "do not do Y"), and the old
+ * front-clipping `truncate` deleted exactly that while the stored text still
+ * read like a complete sentence. Keeping both ends means a clipped record is
+ * still useful, and the seam makes the loss visible to whoever reads it.
+ */
+function clipPreservingTail(text: string, max: number): { text: string; omitted: number } {
+  if (text.length <= max || max < CLIP_RESERVE * 2) return { text: clip(text, max), omitted: Math.max(0, text.length - max) };
+  const keep = max - CLIP_RESERVE;
+  const head = Math.ceil(keep / 2);
+  const tail = keep - head;
+  const omitted = text.length - keep;
+  const seam = ` [...${omitted.toLocaleString("en-US")} chars omitted...] `;
+  if (seam.length > CLIP_RESERVE) return { text: clip(text, max), omitted };
+  return { text: `${text.slice(0, head)}${seam}${text.slice(text.length - tail)}`, omitted };
+}
+
+/**
+ * Normalize and cap text that is stored as a record rather than rendered as one
+ * display line. Paragraph breaks survive; the middle goes first.
+ */
+function recordText(text: string, max: number): { text: string; omitted: number } {
+  return clipPreservingTail(normalizeMultiline(text), max);
+}
+
+function clippedNote(omitted: number, max: number): string {
+  if (omitted <= 0) return "";
+  return ` NOTE: ${omitted.toLocaleString("en-US")} characters were dropped from the MIDDLE of what you sent (record cap ${max.toLocaleString("en-US")}); the saved record is marked clipped and the lost text is not recoverable. Write shorter records, or keep the essential detail at the end.`;
 }
 
 // A confirmation echoes a preview only: the sender already knows what they wrote,
@@ -1621,27 +1665,41 @@ export default function (pi: ExtensionAPI) {
     // Refuse rather than silently park the text where no peer will read it: the
     // sender should learn that this room does not do undirected broadcast.
     if (!broadcastsEnabled()) return "Broadcasts are off (set PI_TEAM_ROOM_BROADCAST=1 to enable); use action=ask, action=delegate, or action=checkpoint for context that has a specific reader.";
-    const clean = truncate(text, MAX_UPDATE_LENGTH);
+    const { text: clean, omitted } = recordText(text, MAX_UPDATE_LENGTH);
     if (!clean) throw new Error("Update cannot be empty");
     return updateState((state) => {
       const previous = state.updates.find((item) => item.sessionId === current!.id && item.text === clean);
       if (previous && Date.now() - Date.parse(previous.createdAt) < 10 * 60 * 1000) return "Already shared recently.";
-      state.updates.unshift({ id: randomUUID(), sessionId: current!.id, sessionName: current!.name, project: current!.project, text: clean, createdAt: now() });
+      state.updates.unshift({ id: randomUUID(), sessionId: current!.id, sessionName: current!.name, project: current!.project, text: clean, createdAt: now(), ...(omitted > 0 ? { clipped: true } : {}) });
       state.updates = state.updates.slice(0, LIMITS.maxUpdates);
-      return `Shared with the team: ${clean}`;
+      return `Shared with the team: ${clean}${clippedNote(omitted, MAX_UPDATE_LENGTH)}`;
     });
+  }
+
+  // A durable fact, read by sessions that were not part of the conversation that
+  // wrote it. It gets the record treatment (paragraphs kept, middle dropped) and
+  // its own cap, because a cross-repo contract does not fit in one status line.
+  async function saveFact(text: string): Promise<string> {
+    if (!current) throw new Error("Team room session is not ready");
+    const { text: clean, omitted } = recordText(text, MAX_JOURNAL_LENGTH);
+    if (!clean) throw new Error("A fact or decision is required");
+    await updateState((state) => {
+      state.journal.unshift({ id: randomUUID(), project: current!.project, text: clean, createdAt: now(), sessionName: current!.name, ...(omitted > 0 ? { clipped: true } : {}) });
+      state.journal = state.journal.slice(0, LIMITS.maxJournalItems);
+    });
+    return `Saved to shared history: ${clean}${clippedNote(omitted, MAX_JOURNAL_LENGTH)}`;
   }
 
   async function saveCheckpoint(text: string): Promise<string> {
     if (!current) throw new Error("Team room session is not ready");
-    const clean = truncate(text, MAX_CHECKPOINT_LENGTH);
+    const { text: clean, omitted } = recordText(text, MAX_CHECKPOINT_LENGTH);
     if (!clean) throw new Error("Checkpoint cannot be empty");
-    const checkpoint = { text: clean, updatedAt: now(), sessionId: current.id } satisfies Checkpoint;
+    const checkpoint = { text: clean, updatedAt: now(), sessionId: current.id, ...(omitted > 0 ? { clipped: true } : {}) } satisfies Checkpoint;
     current = { ...current, checkpoint, focus: current.focus || truncate(clean, 180), updatedAt: now(), lastSeenAt: now() };
     await updateState((state) => {
       state.sessions = state.sessions.map((item) => item.id === current!.id ? current! : item);
     });
-    return `Checkpoint saved: ${clean}`;
+    return `Checkpoint saved: ${clean}${clippedNote(omitted, MAX_CHECKPOINT_LENGTH)}`;
   }
 
   async function sendPeerMessage(
@@ -1869,7 +1927,10 @@ export default function (pi: ExtensionAPI) {
       // focus/latest prompt so teammates still get a resume point.
       if (!snapshot.checkpoint && snapshot.startedAt && Date.now() - Date.parse(snapshot.startedAt) >= AUTO_CHECKPOINT_MIN_MS) {
         const hint = snapshot.focus || recentUserPrompt(ctx);
-        if (hint) snapshot.checkpoint = { text: `[auto] ${truncate(hint, MAX_CHECKPOINT_LENGTH)}`, updatedAt: now(), sessionId: snapshot.id, auto: true };
+        if (hint) {
+          const auto = recordText(hint, MAX_CHECKPOINT_LENGTH - 7);
+          snapshot.checkpoint = { text: `[auto] ${auto.text}`, updatedAt: now(), sessionId: snapshot.id, auto: true, ...(auto.omitted > 0 ? { clipped: true } : {}) };
+        }
       }
       await writeSessionRecord(snapshot, { force: true });
     }
@@ -1953,13 +2014,8 @@ export default function (pi: ExtensionAPI) {
           return toolResult("checkpoint", await saveCheckpoint(params.text));
         }
         case "remember": {
-          const clean = truncate(params.text || "", MAX_UPDATE_LENGTH);
-          if (!clean) return toolResult("remember", "A fact or decision is required.");
-          await updateState((state) => {
-            state.journal.unshift({ id: randomUUID(), project: session.project, text: clean, createdAt: now(), sessionName: session.name });
-            state.journal = state.journal.slice(0, LIMITS.maxJournalItems);
-          });
-          return toolResult("remember", `Saved to shared history: ${clean}`);
+          if (!params.text?.trim()) return toolResult("remember", "A fact or decision is required.");
+          return toolResult("remember", await saveFact(params.text));
         }
         case "history": {
           const state = await readState();
@@ -2031,13 +2087,8 @@ export default function (pi: ExtensionAPI) {
           if (!text) { ctx.ui.notify(session.checkpoint ? `Checkpoint: ${session.checkpoint.text}` : "No checkpoint saved.", "info"); return; }
           ctx.ui.notify(await saveCheckpoint(text), "info");
         } else if (subcommand === "remember") {
-          const clean = truncate(text, MAX_UPDATE_LENGTH);
-          if (!clean) throw new Error("Usage: /team remember <fact or decision>");
-          await updateState((state) => {
-            state.journal.unshift({ id: randomUUID(), project: session.project, text: clean, createdAt: now(), sessionName: session.name });
-            state.journal = state.journal.slice(0, LIMITS.maxJournalItems);
-          });
-          ctx.ui.notify(`Saved to shared history: ${clean}`, "info");
+          if (!text.trim()) throw new Error("Usage: /team remember <fact or decision>");
+          ctx.ui.notify(await saveFact(text), "info");
         } else if (subcommand === "history") {
           ctx.ui.notify(renderHistory(searchJournal(await readState(), session, text)), "info");
         } else {

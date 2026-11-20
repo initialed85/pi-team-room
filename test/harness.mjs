@@ -362,6 +362,37 @@ try {
   await call(bravo, { action: "remember", text: "use vitest for team-room tests" });
   assert.match(await call(alpha, { action: "history", query: "vitest" }), /vitest/);
 
+  // Caps must not eat the actionable end of a record. Both writers used to
+  // front-clip and then report plain success, so a session could resume from a
+  // checkpoint whose last line - the resume instruction - had been deleted.
+  const tailPhrase = "ACTION AT THE END: run npm test before pushing";
+  const longCheckpoint = `resume point: /tmp/project-alpha PLAN.md ${"padding ".repeat(300)} ${tailPhrase}`;
+  const checkpointResult = await call(bravo, { action: "checkpoint", text: longCheckpoint });
+  assert.match(checkpointResult, /dropped from the MIDDLE/, "a clipped checkpoint tells the writer");
+  const savedCheckpoint = JSON.parse(readFileSync(statePath, "utf8")).sessions
+    .find((session) => session.id === bravo.ctx.sessionManager.getSessionId()).checkpoint;
+  assert.ok(savedCheckpoint.text.endsWith(tailPhrase), "checkpoint clipping keeps the actionable tail");
+  assert.match(savedCheckpoint.text, /chars omitted/, "the saved record says its own middle is gone");
+  assert.equal(savedCheckpoint.clipped, true, "the record is marked clipped for whoever reads it next");
+  assert.ok(savedCheckpoint.text.length <= 2000, "the cap still bounds the stored record");
+
+  // A durable fact used to share the one-line status cap, so a cross-repo
+  // contract was chopped at 500 characters without a word of complaint.
+  const longFact = `CONTRACT: ${"field names and their meanings ".repeat(40)} the tail of the contract`;
+  assert.ok(longFact.length > 500 && longFact.length < 2000, "the fact is over the old status cap");
+  const factResult = await call(bravo, { action: "remember", text: longFact });
+  assert.doesNotMatch(factResult, /dropped from the MIDDLE/, "a fact inside the journal cap is stored whole");
+  const savedFact = JSON.parse(readFileSync(statePath, "utf8")).journal
+    .find((item) => item.text.includes("the tail of the contract"));
+  assert.ok(savedFact, "a fact longer than the old status cap survives");
+  assert.equal(savedFact.clipped, undefined, "an unclipped record is not marked clipped");
+  const overlongFact = await call(bravo, { action: "remember", text: `${"head words "}${"filler ".repeat(500)}${tailPhrase}` });
+  assert.match(overlongFact, /dropped from the MIDDLE/, "an over-cap fact is disclosed, not silently amputated");
+  const savedOverlongFact = JSON.parse(readFileSync(statePath, "utf8")).journal
+    .find((item) => item.text.endsWith(tailPhrase));
+  assert.ok(savedOverlongFact, "an over-cap fact still keeps its tail");
+  assert.equal(savedOverlongFact.clipped, true);
+
   // Direct questions wake idle peers. Busy peers receive a follow-up by default,
   // while senders can explicitly request a steer when delaying could waste work.
   const charlie = makePeer("cccccccc-1111-2222-3333-444444444444", "charlie", true, "/tmp/project-charlie");
