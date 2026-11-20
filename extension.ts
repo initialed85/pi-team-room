@@ -896,6 +896,15 @@ export default function (pi: ExtensionAPI) {
   // After a compaction the earlier pulse is no longer in context, so the next
   // turn has to restate the room and the checkpoint in full.
   let restockRoomContext = true;
+  // The dedupe below trusts that a pulse or checkpoint this session already
+  // injected is still in the model's context. Compaction and tree navigation can
+  // take those entries away, so anything that rewrites history has to restock
+  // them - otherwise a rewound session resumes with no room context at all.
+  const forgetRoomContextShown = () => {
+    restockRoomContext = true;
+    lastPulse = undefined;
+    lastCheckpointShownAt = undefined;
+  };
   let deliveryInFlight = false;
   // Messages already pushed into this session in-process. If the delivered stamp
   // fails to land, the next poll must not wake the peer a second time for them.
@@ -1836,6 +1845,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     projectInfo = undefined;
+    // A reload, resume, or fork starts a fresh extension runtime, so this is
+    // already true. Say it out loud anyway: the first turn after one of these is
+    // the turn that has to carry the checkpoint in full, because it is the turn
+    // an auto-resume or a self-restart arrives on.
+    forgetRoomContextShown();
     await ensureSession(ctx, "idle");
     // A resumed or continued session already has a transcript worth indexing
     // before the first turn ends, but session start is not the place to pay for
@@ -1875,13 +1889,16 @@ export default function (pi: ExtensionAPI) {
     // The summary replaces older entries, including the room's pulse and
     // checkpoint. Ask for them again on the next turn instead of letting the
     // session resume blind.
-    restockRoomContext = true;
-    lastPulse = undefined;
-    lastCheckpointShownAt = undefined;
+    forgetRoomContextShown();
     queueSessionHistory(ctx);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
+    // Navigating the tree rewinds the conversation, potentially past the entries
+    // the room already showed - the same hazard as a compaction. A session that
+    // self-reloads lands here too, and that is exactly the turn that needs its
+    // checkpoint in full.
+    forgetRoomContextShown();
     queueSessionHistory(ctx);
   });
 

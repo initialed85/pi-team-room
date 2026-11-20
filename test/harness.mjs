@@ -304,14 +304,23 @@ try {
   // copy, and a one-line pointer otherwise.
   await call(bravo, { action: "checkpoint", text: "resume at the pulse assertions in test/harness.mjs" });
   const withFreshCheckpoint = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
+  assert.ok(withFreshCheckpoint.message, "a checkpoint that moved earns an injection");
   assert.match(withFreshCheckpoint.message.content, /resume at the pulse assertions/, "a checkpoint that moved is shown in full");
   await alpha.handlers.before_agent_start({ systemPrompt: "BASE" }, alpha.ctx);
   const pulseMovedButCheckpointDidNot = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
+  assert.ok(pulseMovedButCheckpointDidNot.message, "a changed pulse still earns an injection");
   assert.match(pulseMovedButCheckpointDidNot.message.content, /Team pulse/, "the changed pulse is still delivered");
   assert.match(pulseMovedButCheckpointDidNot.message.content, /checkpoint is unchanged/, "an unchanged checkpoint is not repeated");
   assert.ok(!pulseMovedButCheckpointDidNot.message.content.includes("resume at the pulse assertions"), "the unchanged checkpoint is a pointer, not a re-send");
+  // Skipping an injection is only safe while the model can still see the entry
+  // that was skipped for. Tree navigation rewinds history past it.
+  await bravo.handlers.session_tree({}, bravo.ctx);
+  const afterTreeRewind = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
+  assert.ok(afterTreeRewind.message, "a tree rewind earns a fresh injection");
+  assert.match(afterTreeRewind.message.content, /resume at the pulse assertions/, "a tree rewind restates the room and the checkpoint in full");
   await bravo.handlers.session_compact({}, bravo.ctx);
   const afterCompaction = await bravo.handlers.before_agent_start({ systemPrompt: "BASE" }, bravo.ctx);
+  assert.ok(afterCompaction.message, "a compaction earns a fresh injection");
   assert.match(afterCompaction.message.content, /resume at the pulse assertions/, "a compaction restates the room and the checkpoint in full");
   assert.match(await call(bravo, { action: "pulse" }), /flaky test/, "a quiet turn start does not swallow the update for later pulls");
   process.env.PI_TEAM_ROOM_BROADCAST = "1";

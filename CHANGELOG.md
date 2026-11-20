@@ -18,8 +18,12 @@
   byte-identical to the one already in context now returns the stable system prompt and appends
   nothing; a checkpoint that has not moved since it was last shown becomes a one-line pointer. A new
   checkpoint, or a compaction (which removed the earlier copy from context), restates both in full.
+  So does navigating the session tree, and any fresh `session_start` (`reload`, `resume`, `fork`,
+  `new`) - those are the turns an auto-resume or a self-restart arrives on, and the model may no
+  longer hold the earlier copy. Skipping an injection is only ever safe while the entry it skips is
+  still in context.
   Regression coverage asserts the quiet turn appends nothing, a moved checkpoint is shown in full, an
-  unchanged one is not repeated, and a compaction restates it.
+  unchanged one is not repeated, and that a compaction and a tree rewind both restate it.
 - Keep volatile pulse data out of the per-turn system prompt. The static room protocol remains in the system prompt, while the current pulse is delivered as hidden appended turn context so peer status, membership, checkpoints, and messages cannot invalidate the reusable provider prefix. Regression coverage asserts that dynamic pulse content is absent from the system prompt and remains available in the appended context.
 - Each session now **owns a lane** and is the tiebreaker inside it. Ownership shows as `owns:` in the
   pulse, on every send confirmation, and on every delivered message; it defaults to the part of the
